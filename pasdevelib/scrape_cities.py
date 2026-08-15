@@ -68,7 +68,28 @@ def run(city_ids: list[str] | None = None) -> None:
                 print(f"[scrape_cities] {city_id}: ECHEC upload ({e})")
 
         # 3. stations_cities.json — liste de toutes les stations multi-villes
-        stations_data = []
+        #
+        # BUG CORRIGE ICI : ce fichier etait entierement RECONSTRUIT a
+        # partir de `df`, qui ne contient QUE les villes traitees par
+        # CETTE execution (chaque ville a son propre workflow, horaires
+        # differents) — a chaque run, toutes les autres villes disparaissaient
+        # du fichier, remplacees par la derniere ville dont le scrape avait
+        # tourne. Consequence concrete : stations_cities.json ne contenait
+        # plus qu'UNE seule ville a la fois, cassant find_spatial_neighbors
+        # (KeyError) et la conversion fill_rate -> capacite pour toutes les
+        # autres villes secondaires. Fusionne desormais avec l'existant :
+        # ne remplace que les stations des villes traitees ici, conserve
+        # celles des autres villes telles quelles.
+        existing_path = tmp_dir / "stations_cities_existing.json"
+        existing_stations: list[dict] = []
+        if storage.download_asset(RELEASE_CITIES, "stations_cities.json", existing_path):
+            try:
+                existing_stations = json.loads(existing_path.read_text())
+            except Exception as e:
+                print(f"[scrape_cities] stations_cities.json existant illisible ({e}), reconstruction depuis zero")
+
+        cities_in_this_run = set(df["city_id"].unique())
+        stations_data = [s for s in existing_stations if s.get("city_id") not in cities_in_this_run]
         for _, row in df.iterrows():
             stations_data.append({
                 "station_id": row["station_id"],
@@ -81,7 +102,8 @@ def run(city_ids: list[str] | None = None) -> None:
         stations_path = tmp_dir / "stations_cities.json"
         stations_path.write_text(json.dumps(stations_data, ensure_ascii=False))
         storage.upload_asset(RELEASE_CITIES, stations_path, "stations_cities.json")
-        print(f"[scrape_cities] stations_cities.json uploadé ({len(stations_data)} stations)")
+        print(f"[scrape_cities] stations_cities.json uploadé ({len(stations_data)} stations, "
+              f"{len(cities_in_this_run)} ville(s) mise(s) à jour dans cette exécution)")
 
 
 if __name__ == "__main__":

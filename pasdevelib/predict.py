@@ -294,6 +294,30 @@ def predict_day_with_quantiles(
 
     # Enrichir candidates avec tendance réseau
     candidates = calendar_df[calendar_df["date"] != target_date.isoformat()].copy()
+
+    # BUG CORRIGE ICI : candidates venait du calendrier NATIONAL partage
+    # (2020 -> aujourd'hui, ~2100 jours), sans jamais etre restreint aux
+    # dates REELLEMENT presentes dans hourly_history de CETTE ville.
+    # Sans consequence pour Paris (historique large qui couvre la quasi
+    # totalite du calendrier), mais catastrophique pour une ville avec
+    # seulement quelques semaines d'historique : find_analog_days
+    # choisissait les "meilleures" journees analogues sur TOUT le
+    # calendrier (ex. un jour de mars 2023 au climat proche), puis
+    # `sub = hourly_history[...isin(analog_dates)]` se retrouvait VIDE
+    # puisque ces dates n'existaient simplement pas dans les quelques
+    # semaines de donnees reelles de la ville — d'ou aucune prediction
+    # generee du tout, silencieusement, pour toutes les villes
+    # secondaires. Restreint desormais aux dates ou l'on a reellement de
+    # la donnee pour cette ville avant de chercher les analogues.
+    # BUG CORRIGE ICI (trouve en testant le correctif ci-dessus sur de
+    # vraies donnees) : calendar_df["date"] contient des objets
+    # datetime.date, hourly_history["date"] contient des chaines — .isin()
+    # ne matchait donc JAMAIS, meme pour un jour strictement identique.
+    # Normalise les deux cotes en chaines ISO avant comparaison.
+    available_dates = set(hourly_history["date"].astype(str).unique())
+    candidates["date"] = candidates["date"].astype(str)
+    candidates = candidates[candidates["date"].isin(available_dates)]
+
     if network_trend is not None and "network_empty_rate" in network_trend.columns:
         # Ajouter la tendance réseau moyenne de la journée comme feature
         avg_network = network_trend.groupby("weekday")["network_empty_rate"].mean().to_dict()
