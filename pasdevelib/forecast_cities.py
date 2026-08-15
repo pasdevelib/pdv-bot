@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import io
+import json
 import tempfile
 from pathlib import Path
 
@@ -193,6 +194,30 @@ def run_city(city_id: str, calendar_existing: pd.DataFrame) -> None:
         output.to_parquet(out_path, compression="snappy", index=False)
         storage.upload_asset(RELEASE_CITIES_AGGREGATES, out_path, out_name)
         print(f"[forecast_cities] {city_id}: {out_name} uploadé ({len(output):,} lignes)")
+
+        # Fichier compagnon de transparence/explicabilite (JSON, leger,
+        # un enregistrement par jour cible) — expose EXACTEMENT quels
+        # jours passes ont ete utilises pour chaque prediction, consomme
+        # par une page admin dediee. Separe du parquet principal pour
+        # eviter de repeter la meme chaine sur ~150+ lignes par jour et
+        # rester trivial a lire cote webapp (JSON simple, pas de lecteur
+        # parquet necessaire).
+        explain = (
+            final[["target_date", "analog_level", "analog_dates"]]
+            .drop_duplicates(subset=["target_date"])
+            .to_dict(orient="records")
+        )
+        # n_neighbors variait par (station, hour) — pas une mesure fiable
+        # au niveau du jour. Le vrai compte de jours analogues utilises
+        # (constant pour un target_date donne) est simplement la longueur
+        # de analog_dates.
+        for row in explain:
+            row["n_analog_days"] = len(row["analog_dates"].split(",")) if row["analog_dates"] else 0
+        explain_name = f"forecast_explain_{city_id}.json"
+        explain_path = tmp_dir / explain_name
+        explain_path.write_text(json.dumps(explain, ensure_ascii=False))
+        storage.upload_asset(RELEASE_CITIES_AGGREGATES, explain_path, explain_name)
+        print(f"[forecast_cities] {city_id}: {explain_name} uploadé ({len(explain)} jour(s))")
 
 
 def run(city_ids: list[str] | None = None) -> None:

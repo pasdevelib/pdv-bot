@@ -471,5 +471,12 @@ def predict_day_with_quantiles(
     grouped["prob_empty"] = 1.0 - grouped["proba_velib"]
     grouped["target_date"] = target_date.isoformat()
     grouped["analog_level"] = level
+    # Transparence/explicabilite pour l'admin : les VRAIS jours utilises
+    # pour cette prediction (partages entre toutes les stations de ce
+    # target_date — voir le commentaire plus haut sur pourquoi
+    # find_analog_days n'est appele qu'une fois par jour cible, pas par
+    # station). Rejoint en une seule chaine pour rester compatible avec
+    # le format parquet en colonnes.
+    grouped["analog_dates"] = ",".join(sorted(analog_dates))
 
     return grouped
