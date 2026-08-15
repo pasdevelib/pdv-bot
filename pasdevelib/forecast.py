@@ -229,6 +229,20 @@ def run() -> None:
         output.to_parquet(path, compression="snappy", index=False)
         storage.upload_asset(storage.RELEASE_AGGREGATES, path, FORECAST_ASSET)
 
+        # Meme transparence/explicabilite que forecast_cities.py — voir
+        # ce commit pour le detail complet du raisonnement.
+        explain = (
+            final[["target_date", "analog_level", "analog_dates"]]
+            .drop_duplicates(subset=["target_date"])
+            .to_dict(orient="records")
+        )
+        for row in explain:
+            row["n_analog_days"] = len(row["analog_dates"].split(",")) if row["analog_dates"] else 0
+        explain_path = Path(tmp) / "forecast_explain_paris.json"
+        explain_path.write_text(json.dumps(explain, ensure_ascii=False))
+        storage.upload_asset(storage.RELEASE_AGGREGATES, explain_path, "forecast_explain_paris.json")
+        print(f"[forecast] forecast_explain_paris.json uploadé ({len(explain)} jour(s))")
+
 
     # ── Forecast 30min par interpolation linéaire ─────────────────
     # Permet les horizons +15/+30/+45/+60 min dans la webapp
