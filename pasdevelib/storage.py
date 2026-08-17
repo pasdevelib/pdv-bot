@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -41,15 +43,43 @@ def ensure_release(tag: str, title: str | None = None) -> None:
 
 
 def upload_asset(tag: str, local_path: Path, asset_name: str | None = None) -> None:
-    """Upload un fichier comme asset de la release. Écrase si existe."""
+    """Upload un fichier comme asset de la release. Écrase si existe.
+
+    BUG CORRIGE ICI : constate en prod — plusieurs villes tournent sur
+    des workflows GitHub Actions independants, dont les horaires peuvent
+    se chevaucher, et qui uploadent TOUTES vers la meme release
+    (`cities-live`), parfois le meme asset exact (stations_cities.json,
+    desormais fusionne plutot qu'ecrase — voir scrape_cities.py). `gh
+    release upload --clobber` fait en interne un delete puis un upload ;
+    deux executions concurrentes sur le meme nom d'asset peuvent entrer
+    en collision cote API GitHub (l'une supprime l'asset pendant que
+    l'autre tente de l'uploader), faisant echouer l'une des deux avec un
+    simple exit code 1 sans autre contexte. Retente desormais avec un
+    backoff + gigue aleatoire avant d'abandonner pour de bon — la
+    plupart de ces conflits sont transitoires et se resolvent seuls au
+    second essai.
+    """
     name = asset_name or local_path.name
-    # `--clobber` remplace l'asset s'il existe déjà
-    _run([
-        "gh", "release", "upload", tag,
-        f"{local_path}#{name}",
-        "--repo", REPO,
-        "--clobber",
-    ])
+    last_result = None
+    for attempt in range(4):
+        # `--clobber` remplace l'asset s'il existe déjà
+        last_result = _run([
+            "gh", "release", "upload", tag,
+            f"{local_path}#{name}",
+            "--repo", REPO,
+            "--clobber",
+        ], check=False)
+        if last_result.returncode == 0:
+            return
+        if attempt < 3:
+            wait = (2 ** attempt) + random.uniform(0, 1.5)
+            print(f"[storage] upload_asset({tag}, {name}) échec (tentative {attempt + 1}/4), "
+                  f"nouvel essai dans {wait:.1f}s — {(last_result.stderr or '').strip()[:200]}")
+            time.sleep(wait)
+    raise RuntimeError(
+        f"upload_asset({tag}, {name}) a échoué après 4 tentatives : "
+        f"{(last_result.stderr or '').strip() if last_result else 'inconnu'}"
+    )
 
 
 def download_asset(tag: str, asset_name: str, dest: Path) -> Path | None:

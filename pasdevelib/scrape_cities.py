@@ -80,6 +80,19 @@ def run(city_ids: list[str] | None = None) -> None:
         # autres villes secondaires. Fusionne desormais avec l'existant :
         # ne remplace que les stations des villes traitees ici, conserve
         # celles des autres villes telles quelles.
+        #
+        # RISQUE RESIDUEL CONNU (pas resolu ici, juste documente) : si
+        # deux villes executent ce telechargement-fusion-upload EXACTEMENT
+        # en meme temps, chacune peut lire l'existant AVANT que l'autre
+        # n'ait publie sa propre mise a jour — la seconde ecriture peut
+        # alors ecraser la contribution de la premiere (probleme classique
+        # de "lost update"). storage.upload_asset() retente desormais en
+        # cas de conflit d'ECRITURE (erreur API transitoire), mais ne
+        # protege pas contre cette race LOGIQUE plus subtile. Impact
+        # limite en pratique (les horaires des workflows sont decales, la
+        # fenetre de collision est courte), mais une vraie solution
+        # necessiterait un verrou explicite si ça devient un probleme
+        # observe plus tard.
         existing_path = tmp_dir / "stations_cities_existing.json"
         existing_stations: list[dict] = []
         if storage.download_asset(RELEASE_CITIES, "stations_cities.json", existing_path):
