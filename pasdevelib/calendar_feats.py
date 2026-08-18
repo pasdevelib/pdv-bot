@@ -167,3 +167,69 @@ def build_calendar(start: dt.date, end: dt.date) -> pd.DataFrame:
     df["is_disruption_day"] = df["is_greve"] | df["is_event"]
 
     return df
+
+
+def month_to_season(month: int) -> str:
+    if month in (12, 1, 2):
+        return "hiver"
+    if month in (3, 4, 5):
+        return "printemps"
+    if month in (6, 7, 8):
+        return "ete"
+    return "automne"
+
+
+def enrich_derived_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Ajoute les alias/derives attendus par predict.py._row_distance
+    (day_of_week, is_holiday, is_school_holiday, season) à partir des
+    colonnes brutes de build_calendar (weekday, is_ferie, is_vacances,
+    month).
+
+    BUG CORRIGE (trouve en investiguant pourquoi les "jours analogues"
+    choisis pour Paris remontaient a fin 2020 sans rapport avec la
+    saison/meteo cible) : calendar.parquet (produit par build_calendar)
+    n'a JAMAIS eu ces colonnes — seul _build_target_features (forecast.py)
+    les calculait, et UNIQUEMENT pour les quelques jours CIBLES a predire,
+    jamais pour le bassin de candidats HISTORIQUES compare dans
+    find_analog_days. Consequence concrete : row_a (cible) avait de vraies
+    valeurs, row_b (candidat) renvoyait toujours None pour ces champs — la
+    comparaison de distance etait donc non-discriminante pour praticalement
+    tous les criteres calendaires, et totalement absente pour la meteo
+    (aucune colonne temp_avg/precip_total sur les candidats). Avec des
+    distances quasiment toutes egales, le tri stable de pandas preservait
+    l'ordre original du calendrier (chronologique, du plus ancien au plus
+    recent) — d'ou une selection biaisee vers les dates les plus anciennes
+    disponibles, sans lien reel avec la similarite meteo/saison recherchee.
+    """
+    out = df.copy()
+    if "weekday" in out.columns:
+        out["day_of_week"] = out["weekday"]
+    if "is_ferie" in out.columns:
+        out["is_holiday"] = out["is_ferie"]
+    if "is_vacances" in out.columns:
+        out["is_school_holiday"] = out["is_vacances"]
+    if "month" in out.columns:
+        out["season"] = out["month"].apply(month_to_season)
+    return out
+
+
+def aggregate_daily_weather(weather_hourly: pd.DataFrame) -> pd.DataFrame:
+    """Agrege un DataFrame meteo horaire (colonnes ts, temperature_2m,
+    apparent_temperature, precipitation, ...) en moyennes/sommes
+    journalieres — meme logique que _build_target_features (forecast.py),
+    extraite ici pour etre reutilisable sur l'historique complet
+    (weather.parquet) et pas seulement sur les quelques jours cibles.
+    """
+    w = weather_hourly.copy()
+    w["date"] = pd.to_datetime(w["ts"]).dt.tz_convert("Europe/Paris").dt.date.astype(str)
+    w = w.sort_values(["date", "ts"])
+    w["precip_3h"] = (
+        w.groupby("date", group_keys=False)["precipitation"]
+        .apply(lambda s: s.rolling(3, min_periods=1).sum())
+    )
+    return w.groupby("date", as_index=False).agg(
+        temp_avg=("temperature_2m", "mean"),
+        mean_apparent_temperature=("apparent_temperature", "mean"),
+        precip_total=("precipitation", "sum"),
+        precip_3h_max=("precip_3h", "max"),
+    )

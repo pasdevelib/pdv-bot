@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
+from pasdevelib import calendar_feats
+
 
 @dataclass
 class AnalogConfig:
@@ -284,6 +286,7 @@ def predict_day_with_quantiles(
     anomaly_stats: pd.DataFrame | None = None,
     network_trend: pd.DataFrame | None = None,
     current_fill_rates: dict[str, float] | None = None,
+    weather_daily: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Prédit pour chaque (station, hour).
 
@@ -294,6 +297,22 @@ def predict_day_with_quantiles(
 
     # Enrichir candidates avec tendance réseau
     candidates = calendar_df[calendar_df["date"] != target_date.isoformat()].copy()
+
+    # BUG CORRIGE ICI (le plus important trouve en investiguant les "jours
+    # analogues" de 2020 pour Paris) : candidates n'avait JAMAIS les
+    # colonnes day_of_week/is_holiday/is_school_holiday/season/temp_avg
+    # que _row_distance compare — seul target_features les avait (calcule
+    # a part dans forecast.py). Sans ca, la quasi-totalite des criteres de
+    # _row_distance etait non-discriminante (comparaison contre None sur
+    # tous les candidats a la fois), rendant la selection des jours
+    # analogues essentiellement arbitraire (biaisee vers les dates les
+    # plus anciennes du fait du tri stable sur des distances quasi-egales)
+    # plutot que reellement basee sur la similarite meteo/saison/jour.
+    # Voir calendar_feats.enrich_derived_features et .aggregate_daily_weather
+    # pour le detail complet du raisonnement.
+    candidates = calendar_feats.enrich_derived_features(candidates)
+    if weather_daily is not None and not weather_daily.empty:
+        candidates = candidates.merge(weather_daily, on="date", how="left")
 
     # BUG CORRIGE ICI : candidates venait du calendrier NATIONAL partage
     # (2020 -> aujourd'hui, ~2100 jours), sans jamais etre restreint aux

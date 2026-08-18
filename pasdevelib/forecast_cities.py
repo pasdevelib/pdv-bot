@@ -167,6 +167,7 @@ def run_city(city_id: str, calendar_existing: pd.DataFrame) -> None:
                 flux_graph=None,
                 anomaly_stats=None,
                 network_trend=None,
+                weather_daily=weather_daily_hist,
             )
             if not pred.empty:
                 all_predictions.append(pred)
@@ -230,6 +231,18 @@ def run(city_ids: list[str] | None = None) -> None:
     # analogues candidats — voir limite connue dans la docstring du module).
     print("[forecast_cities] loading national calendar...")
     calendar_existing = _download_parquet(storage.RELEASE_AGGREGATES, CALENDAR_ASSET)
+
+    # Meme correctif que forecast.py (voir predict.py pour le detail complet
+    # du bug corrige) : sans meteo/saison sur les candidats, le matching
+    # d'analogues degenerait vers une selection quasi arbitraire. Reutilise
+    # la meteo nationale (meme limite connue et acceptee que le calendrier).
+    try:
+        weather_hourly_hist = _download_parquet(storage.RELEASE_AGGREGATES, "weather.parquet")
+        weather_daily_hist = calendar_feats.aggregate_daily_weather(weather_hourly_hist)
+        print(f"[forecast_cities] {len(weather_daily_hist):,} jours de meteo historique charges")
+    except Exception as e:
+        weather_daily_hist = None
+        print(f"[forecast_cities] meteo historique non chargee ({e}), matching sans meteo sur les candidats")
 
     for city_id in city_ids:
         # Isolation par ville (même principe que consolidate_cities.py) :

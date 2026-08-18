@@ -24,6 +24,7 @@ from pasdevelib import calendar_feats, predict, storage, weather
 FORECAST_ASSET = "forecast_7d.parquet"
 CALENDAR_ASSET = "calendar.parquet"
 HOURLY_ASSET = "hourly_history.parquet"
+WEATHER_ASSET = "weather.parquet"
 STATIONS_ASSET = "stations.json"
 
 
@@ -97,6 +98,19 @@ def run() -> None:
     hourly = _download_parquet(storage.RELEASE_AGGREGATES, HOURLY_ASSET)
     calendar_existing = _download_parquet(storage.RELEASE_AGGREGATES, CALENDAR_ASSET)
     print(f"[forecast] {len(hourly):,} historical rows")
+
+    # Meteo journaliere HISTORIQUE (pas seulement les 7 jours cibles) —
+    # necessaire pour que la comparaison meteo dans find_analog_days ait
+    # reellement quelque chose a comparer sur les candidats. Voir
+    # calendar_feats.aggregate_daily_weather et le commentaire dans
+    # predict.py pour le detail du bug que ceci corrige.
+    try:
+        weather_hourly_hist = _download_parquet(storage.RELEASE_AGGREGATES, WEATHER_ASSET)
+        weather_daily_hist = calendar_feats.aggregate_daily_weather(weather_hourly_hist)
+        print(f"[forecast] {len(weather_daily_hist):,} jours de meteo historique charges")
+    except Exception as e:
+        weather_daily_hist = None
+        print(f"[forecast] meteo historique non chargee ({e}), matching sans meteo sur les candidats")
 
     print("[forecast] loading stations metadata...")
     stations_raw = _download_json(storage.RELEASE_LIVE, STATIONS_ASSET)
@@ -197,6 +211,7 @@ def run() -> None:
             anomaly_stats=anomaly_stats,
             network_trend=network_trend,
             cfg=predict_cfg,
+            weather_daily=weather_daily_hist,
         )
         if not pred.empty:
             all_predictions.append(pred)
