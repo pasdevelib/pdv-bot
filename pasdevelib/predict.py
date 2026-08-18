@@ -348,7 +348,18 @@ def predict_day_with_quantiles(
           + (" [GREVE]" if target_features.get("is_greve") else "")
           + (" [EVENT]" if target_features.get("is_event") else ""))
 
-    sub = hourly_history[hourly_history["date"].isin(analog_dates)].copy()
+    # BUG CORRIGE ICI : meme classe de probleme que le fix sur `candidates`
+    # plus haut, mais sur une ligne DIFFERENTE, pre-existante, jamais
+    # touchee jusqu'ici. Pour Paris specifiquement, hourly_history["date"]
+    # contient des objets datetime.date (pas des chaines comme pour les
+    # villes secondaires) — analog_dates (calcule plus haut, normalise en
+    # chaines) ne matchait donc JAMAIS avec cette colonne, meme quand
+    # find_analog_days trouvait bien des voisins valides. Consequence
+    # concrete constatee : les predictions Paris etaient TOUJOURS vides
+    # depuis au moins le 14 juillet (forecast_7d.parquet jamais mis a
+    # jour depuis cette date), le workflow "reussissant" quand meme car
+    # `if not all_predictions: skip upload` sort proprement sans erreur.
+    sub = hourly_history[hourly_history["date"].astype(str).isin(analog_dates)].copy()
     if sub.empty:
         return pd.DataFrame()
 
