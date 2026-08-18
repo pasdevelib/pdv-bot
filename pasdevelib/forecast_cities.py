@@ -67,16 +67,6 @@ def _download_json(release: str, asset: str) -> list:
     return r.json()
 
 
-def _month_to_season(month: int) -> str:
-    if month in (12, 1, 2):
-        return "winter"
-    if month in (3, 4, 5):
-        return "spring"
-    if month in (6, 7, 8):
-        return "summer"
-    return "autumn"
-
-
 def _build_target_features(target_dates: list[dt.date], lat: float, lon: float) -> pd.DataFrame:
     n_days = len(target_dates)
     if n_days == 0:
@@ -109,7 +99,10 @@ def _build_target_features(target_dates: list[dt.date], lat: float, lon: float) 
     targets["day_of_week"] = targets["weekday"]
     targets["is_holiday"] = targets["is_ferie"]
     targets["is_school_holiday"] = targets["is_vacances"]
-    targets["season"] = targets["month"].apply(_month_to_season)
+    # Meme correctif que forecast.py (voir ce fichier pour le detail) :
+    # utilise la fonction de saison PARTAGEE (francais) plutot qu'une
+    # copie locale en anglais, pour matcher enrich_derived_features.
+    targets["season"] = targets["month"].apply(calendar_feats.month_to_season)
 
     return targets
 

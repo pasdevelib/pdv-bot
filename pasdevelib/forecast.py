@@ -75,19 +75,19 @@ def _build_target_features(target_dates: list[dt.date]) -> pd.DataFrame:
     targets["day_of_week"] = targets["weekday"]
     targets["is_holiday"] = targets["is_ferie"]
     targets["is_school_holiday"] = targets["is_vacances"]
-    targets["season"] = targets["month"].apply(_month_to_season)
+    # BUG CORRIGE ICI : cette fonction locale produisait des libellés de
+    # saison en ANGLAIS (winter/spring/summer/autumn), alors que
+    # calendar_feats.month_to_season() (utilisee par enrich_derived_features
+    # sur les candidats compares dans find_analog_days) produit du
+    # FRANCAIS (hiver/printemps/ete/automne) — la comparaison de saison
+    # dans _row_distance ne matchait donc JAMAIS ("summer" != "ete"),
+    # meme apres avoir corrige l'absence totale d'enrichissement des
+    # candidats. Utilise desormais la MEME fonction partagee des deux
+    # cotes de la comparaison.
+    targets["season"] = targets["month"].apply(calendar_feats.month_to_season)
 
     return targets
 
-
-def _month_to_season(month: int) -> str:
-    if month in (12, 1, 2):
-        return "winter"
-    if month in (3, 4, 5):
-        return "spring"
-    if month in (6, 7, 8):
-        return "summer"
-    return "autumn"
 
 
 def run() -> None:
