@@ -457,10 +457,22 @@ def predict_day_with_quantiles(
 
     # ── Spatial layer géographique ────────────────────────────────────────────
     if stations_coords is not None and cfg.spatial_weight > 0:
+        # OPTIMISATION AJOUTEE ICI (trouvee en investiguant pourquoi le run
+        # du 19 aout a ete annule apres avoir depasse les 20 minutes de
+        # budget CI) : find_spatial_neighbors(sid, ...) recalculait la
+        # distance geographique de `sid` a TOUTES les ~1500 autres
+        # stations a CHAQUE appel — or grouped_rows contient jusqu'a 24
+        # lignes par station (une par heure), et la distance geographique
+        # entre deux stations ne depend evidemment pas de l'heure. Meme
+        # calcul refait ~24 fois pour rien par station. Cache desormais le
+        # resultat par station_id, calcule une seule fois.
+        spatial_neighbors_cache: dict[str, list[str]] = {}
         for row in grouped_rows:
             sid = str(row["station_id"])
             hour = int(row["hour"])
-            neighbors = find_spatial_neighbors(sid, stations_coords, cfg.spatial_radius_m, cfg.spatial_k)
+            if sid not in spatial_neighbors_cache:
+                spatial_neighbors_cache[sid] = find_spatial_neighbors(sid, stations_coords, cfg.spatial_radius_m, cfg.spatial_k)
+            neighbors = spatial_neighbors_cache[sid]
             neighbor_probas = [
                 station_predictions[n][hour]
                 for n in neighbors
@@ -475,10 +487,15 @@ def predict_day_with_quantiles(
 
     # ── Flux graph (propagation par corrélation) — NOUVEAU V4 ────────────────
     if flux_graph is not None and cfg.flux_weight > 0:
+        # Meme optimisation que le cache spatial ci-dessus : la correlation
+        # de flux entre deux stations ne depend pas de l'heure non plus.
+        flux_neighbors_cache: dict[str, list[tuple[str, float]]] = {}
         for row in grouped_rows:
             sid = str(row["station_id"])
             hour = int(row["hour"])
-            flux_neighbors = find_flux_neighbors(sid, flux_graph, cfg.flux_top_k)
+            if sid not in flux_neighbors_cache:
+                flux_neighbors_cache[sid] = find_flux_neighbors(sid, flux_graph, cfg.flux_top_k)
+            flux_neighbors = flux_neighbors_cache[sid]
             if not flux_neighbors:
                 continue
             weighted_sum = 0.0

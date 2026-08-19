@@ -12,7 +12,12 @@ permissions:
 jobs:
   forecast:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # BUG CORRIGE ICI : le run du 19 aout a ete tue net a 20min17s
+    # (cancelled, pas failed) - pile au budget precedent. Le correctif sur
+    # le matching des jours analogues (enrichissement meteo/saison des
+    # candidats, cf. predict.py) ajoute un peu de calcul, suffisant pour
+    # depasser la limite. Porte a 35 min, marge confortable.
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
 
