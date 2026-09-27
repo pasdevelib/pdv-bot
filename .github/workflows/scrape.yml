@@ -2,69 +2,61 @@ name: scrape
 
 on:
   schedule:
-    # 3 instances parallèles toutes les 5 min avec offset
-    # Instance A : 0, 5, 10, 15... min
     - cron: '*/5 * * * *'
   workflow_dispatch:
 
-# Pas de concurrency lock — on veut des instances parallèles
-# Chaque instance gère son propre verrou via le timestamp
+# BUG CORRIGE ICI (2026-09-27) : le 27 juin 2026 (commit 8126055), ce
+# workflow est passe d'UN SEUL job cron toutes les minutes (avec un
+# verrou concurrency) a TROIS jobs paralleles (scrape-a/b/c) declenches
+# toutes les 5 min, SANS aucun verrou — dans le but d'ameliorer la
+# couverture en comblant les intervalles entre deux declenchements.
+#
+# Consequence non anticipee, et catastrophique : pasdevelib.scrape.run()
+# appelle storage.append_to_parquet() a CHAQUE snapshot (toutes les 30s,
+# via scrape_loop.py), qui fait un cycle telecharge -> modifie -> upload
+# de current_day.parquet SANS verrouillage. Avec 3 jobs qui font ce cycle
+# en parallele (et boucle en interne chacun), le dernier upload a
+# systematiquement ecrase les appends des autres avec une base de depart
+# perimee. Resultat mesure : couverture reelle passee de ~22h/jour
+# (mediane) a ~2h/jour depuis fin juin 2026, et purement et simplement
+# ZERO donnee les 25 et 26 septembre 2026 — deux jours qu'on aurait
+# justement voulu analyser (visite du Pape a Paris). Le pipeline ne
+# plantait jamais (les jobs se terminaient tous en "success"), il
+# ecrasait juste ses propres donnees en silence.
+#
+# Le watchdog (watchdog.yml, ajoute le meme jour) detectait bien le
+# probleme (16 des 20 derniers runs en echec au moment du diagnostic)
+# mais se contentait d'un exit code sans notification reelle — voir le
+# correctif de watchdog.py qui envoie desormais un email.
+#
+# Fix : retour a UN SEUL job. Le verrou concurrency ci-dessous empeche
+# toute execution en parallele (= plus de race sur l'upload), et ce job
+# unique boucle en interne sur ~4min40 a raison d'un scrape toutes les
+# 30s (scrape_loop.py) pour retrouver une couverture quasi continue —
+# sans jamais avoir deux ecritures concurrentes sur le meme asset.
+concurrency:
+  group: scrape
+  cancel-in-progress: false
 
 permissions:
   contents: write
 
 jobs:
-  scrape-a:
-    name: Scrape A (immediate)
+  scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 6
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          cache: pip
-      - name: Install
-        run: pip install -e .
-      - name: Scrape loop (4 min)
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python -m pasdevelib.scrape_loop --duration 240 --interval 30
 
-  scrape-b:
-    name: Scrape B (offset 90s)
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: pip
-      - name: Install
-        run: pip install -e .
-      - name: Wait offset
-        run: sleep 90
-      - name: Scrape loop (2.5 min)
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python -m pasdevelib.scrape_loop --duration 150 --interval 30
 
-  scrape-c:
-    name: Scrape C (offset 3 min)
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          cache: pip
       - name: Install
         run: pip install -e .
-      - name: Wait offset
-        run: sleep 180
-      - name: Scrape loop (1 min)
+
+      - name: Scrape loop (4min40, toutes les 30s)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python -m pasdevelib.scrape_loop --duration 60 --interval 30
+        run: python -m pasdevelib.scrape_loop --duration 280 --interval 30

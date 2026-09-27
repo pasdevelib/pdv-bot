@@ -5,8 +5,12 @@ on:
     - cron: '*/15 * * * *'  # Toutes les 15 min
   workflow_dispatch:
 
+# BUG CORRIGE ICI (2026-09-27) : contents passe a `write` — watchdog.py
+# ecrit desormais un petit marqueur d'etat (watchdog_alert_state.txt) sur
+# la release "live" pour eviter de renvoyer un email toutes les 15 min
+# pendant une panne prolongee (voir pasdevelib/watchdog.py).
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   watchdog:
@@ -24,4 +28,6 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: pasdevelib/pdv-bot
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          WATCHDOG_ALERT_EMAIL: hello@pasdevelib.app
         run: python -m pasdevelib.watchdog
