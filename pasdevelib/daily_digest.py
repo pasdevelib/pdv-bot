@@ -87,7 +87,7 @@ RÈGLES STRICTES :
 - Compare au maximum UN chiffre du jour à UN repère mondial pertinent
   (liste ci-dessous), seulement si la comparaison est vraiment éclairante.
   Ne pas forcer une comparaison si aucune n'est pertinente.
-- Pas de markdown avec des accolades { } ou de blocs de code — texte et
+- Pas de markdown avec des accolades ou de blocs de code — texte et
   titres Markdown standards uniquement (#, ##, **, -, listes).
 - Longueur : 250 à 400 mots.
 
