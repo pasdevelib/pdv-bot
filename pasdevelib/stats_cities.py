@@ -23,6 +23,8 @@ Schema de sortie principal (stats_<ville>_<periode>.json, release
   "city_avg_fill_rate": float,
   "ebike_share": float | null,  # part electrique du parc dispo (0-1)
   "hourly_curve": [{hour: 0-23, avg_fill_rate}, ...],  # profil horaire
+  "n_stations_full_all_day": int,  # stations pleines >= 90% du temps
+  "n_stations_empty_all_day": int, # stations vides >= 90% du temps
   "top_empty":      [{station_id, name, pct_empty, n_obs}, ...] (20 max)
   "top_full":       [{station_id, name, pct_full,  n_obs}, ...] (20 max)
   "most_reliable":  [{station_id, name, pct_healthy, n_obs}, ...] (20 max)
@@ -248,6 +250,14 @@ def compute_period(hourly: pd.DataFrame, names: dict[str, str], zones: dict[str,
         # sources n'existent pas encore pour cette ville.
         "ebike_share": _compute_ebike_share(window),
         "hourly_curve": _compute_hourly_curve(window),
+        # AJOUTE (2026-09-28, demande Théo) : nombre de stations bloquées
+        # quasi tout le temps de la fenêtre (>= 90% des observations),
+        # distinct de top_empty/top_full qui listent les PIRES stations
+        # sans dire combien sont dans ce cas. Seuil 90% plutôt que 100%
+        # pour tolérer un rééquilibrage ponctuel qui sortirait une station
+        # de l'extrême une heure sur toute une journée.
+        "n_stations_full_all_day": int((eligible["pct_full"] >= 0.9).sum()) if not eligible.empty else 0,
+        "n_stations_empty_all_day": int((eligible["pct_empty"] >= 0.9).sum()) if not eligible.empty else 0,
         "top_empty": _rank(eligible, "pct_empty", "pct_empty", names),
         "top_full": _rank(eligible, "pct_full", "pct_full", names),
         "most_reliable": _rank(eligible, "pct_healthy", "pct_healthy", names),

@@ -22,12 +22,15 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import io
 import json
 import re
 import tempfile
 import traceback
 from pathlib import Path
 
+import numpy as np
+import pandas as pd
 import requests
 
 from pasdevelib import storage
@@ -60,6 +63,13 @@ CITY_LABELS = {
     "lille": "Lille", "rennes": "Rennes", "strasbourg": "Strasbourg",
     "montpellier": "Montpellier", "nantes": "Nantes",
 }
+
+# AJOUTE (2026-09-28, demande Théo) : nom court a utiliser dans le titre du
+# bilan — "Vélib' Métropole" (nom officiel complet, cities.py system_name)
+# donnait des titres lourds ("Vélib' Métropole : le bilan du..."). Seul
+# Paris a ce probleme, les 8 autres system_name sont deja courts (Vcub,
+# Vélo'v, V'Lille...) donc pas d'entree necessaire pour elles.
+SHORT_NETWORK_NAME = {"paris": "Vélib'"}
 
 # Repères mondiaux du secteur (VLS), condensés à partir des sources citées
 # dans la discussion du 2026-09-28 (Todd et al. 2021, CIE, ITDP, movmi/ADL,
@@ -126,6 +136,9 @@ RÈGLES STRICTES :
   basée sur une donnée réelle ci-dessous (ex: une station ou un horaire à
   éviter/privilégier). Si aucune donnée ne permet un conseil honnête,
   renvoie une chaîne vide "" plutôt que d'inventer.
+- "titre" : utilise le nom court et usuel du système ({short_name}), PAS
+  son nom officiel complet ({network}) — ex. "{short_name} : le bilan du
+  {date_human}", jamais "{network} : le bilan du ...".
 
 {benchmarks}
 
@@ -174,6 +187,12 @@ def _gather_city_data(city_id: str) -> dict:
             data["part_electrique"] = day_stats["ebike_share"]
         if day_stats.get("hourly_curve"):
             data["profil_horaire_remplissage"] = day_stats["hourly_curve"]
+        # AJOUTE (2026-09-28, demande Théo) : stations bloquées quasi toute
+        # la fenêtre + top 10 sous tension (vides ET pleines confondues,
+        # déjà calculé par stats_cities.py sous "worst" = pct_extreme).
+        data["n_stations_pleines_toute_la_journee"] = day_stats.get("n_stations_full_all_day", 0)
+        data["n_stations_vides_toute_la_journee"] = day_stats.get("n_stations_empty_all_day", 0)
+        data["stations_top_tension"] = (day_stats.get("worst") or [])[:10]
 
     evolution = _download_json(RELEASE_STATS, f"evolution_{city_id}.json")
     if evolution and evolution.get("series"):
@@ -385,6 +404,80 @@ def _parse_json_output(raw: str) -> dict:
     }
 
 
+def _compute_intraday_traffic(date: dt.date) -> list[dict]:
+    """Départs estimés par tranche de 10 minutes sur LA journée du bilan,
+    à partir de l'archive brute (release "history", YYYY-MM-DD.parquet)
+    qui garde chaque relevé individuel — contrairement à
+    hourly_history.parquet (déjà agrégé à l'heure), seule cette
+    granularité permet un découpage à 10 min.
+
+    Paris UNIQUEMENT pour l'instant : seul pdv-bot/consolidate.py archive
+    ce fichier brut par jour (cf. son docstring). pdvr-bot (villes
+    régionales) agrège directement à l'heure sans étape intermédiaire —
+    donc [] pour elles tant que ce n'est pas changé côté pipeline.
+
+    Même méthodologie que compute_traffic() dans stats_cities.py (seules
+    les BAISSES comptent comme "départs", plafond par-station au
+    percentile 90 pour écrêter les camions de rééquilibrage) — dupliquée
+    ici plutôt que partagée car la granularité (10 min vs heure) et le
+    fichier source (archive brute vs hourly_history) diffèrent.
+
+    Renvoie une liste de 144 tranches (00:00 à 23:50). "trips"/"cumulative"
+    sont None pour une tranche jamais couverte par le scraper (au lieu
+    d'un faux 0) — le pipeline a des trous connus (cf. README pdv-bot).
+    """
+    date_str = date.isoformat()
+    url = f"https://github.com/{storage.REPO}/releases/download/history/{date_str}.parquet"
+    r = requests.get(url, timeout=30)
+    if r.status_code != 200:
+        return []
+    df = pd.read_parquet(io.BytesIO(r.content))
+    if df.empty or "fetched_at" not in df.columns:
+        return []
+
+    df["fetched_at"] = pd.to_datetime(df["fetched_at"], utc=True)
+    local_ts = df["fetched_at"].dt.tz_convert("Europe/Paris")
+    df["bucket_min"] = local_ts.dt.hour * 60 + (local_ts.dt.minute // 10) * 10
+    covered_buckets = set(df["bucket_min"].unique().tolist())
+
+    per_bucket = (
+        df.sort_values("fetched_at")
+        .groupby(["station_id", "bucket_min"], as_index=False)["num_bikes_available"]
+        .last()
+        .sort_values(["station_id", "bucket_min"])
+    )
+    per_bucket["prev_bucket"] = per_bucket.groupby("station_id")["bucket_min"].shift(1)
+    per_bucket["prev_bikes"] = per_bucket.groupby("station_id")["num_bikes_available"].shift(1)
+    is_consecutive = (per_bucket["bucket_min"] - per_bucket["prev_bucket"]) == 10
+    delta = per_bucket["num_bikes_available"] - per_bucket["prev_bikes"]
+    departures = (-delta).clip(lower=0)
+    per_bucket["departures"] = departures.where(is_consecutive, other=np.nan)
+
+    if len(per_bucket) > 0:
+        station_p90 = per_bucket.groupby("station_id")["departures"].transform(
+            lambda x: x.quantile(0.90) if (x > 0).any() else 0
+        )
+        per_bucket["departures"] = np.minimum(per_bucket["departures"], station_p90)
+
+    valid = per_bucket.dropna(subset=["departures"])
+    by_bucket = valid.groupby("bucket_min")["departures"].sum()
+
+    result = []
+    cumulative = 0.0
+    for bucket_min in range(0, 24 * 60, 10):
+        has_data = bucket_min in covered_buckets
+        trips = float(by_bucket.get(bucket_min, 0.0)) if has_data else 0.0
+        if has_data:
+            cumulative += trips
+        h, m = divmod(bucket_min, 60)
+        result.append({
+            "time": f"{h:02d}:{m:02d}",
+            "trips": round(trips) if has_data else None,
+            "cumulative": round(cumulative) if has_data else None,
+        })
+    return result
+
+
 def _api_key_env_var(city_id: str) -> str:
     return f"GEMINI_API_KEY_{city_id.upper()}"
 
@@ -419,6 +512,7 @@ def run_city(city_id: str, date: dt.date) -> None:
     prompt = PROMPT_TEMPLATE.format(
         city_label=city_label,
         network=network,
+        short_name=SHORT_NETWORK_NAME.get(city_id, network),
         date_human=date_human,
         benchmarks=BENCHMARKS,
         data_json=json.dumps(data, ensure_ascii=False, indent=2, default=str),
@@ -448,6 +542,15 @@ def run_city(city_id: str, date: dt.date) -> None:
         "conseil_usager": parsed["conseil_usager"],
         "ebike_share": data.get("part_electrique"),
         "hourly_curve": data.get("profil_horaire_remplissage", []),
+        "n_stations_full_all_day": data.get("n_stations_pleines_toute_la_journee", 0),
+        "n_stations_empty_all_day": data.get("n_stations_vides_toute_la_journee", 0),
+        "top_tension": data.get("stations_top_tension", []),
+        # Départs par tranche de 10 min sur la journée du bilan — Paris
+        # uniquement pour l'instant (cf. docstring de la fonction). Appel
+        # séparé de _gather_city_data() : source différente (archive brute
+        # "history", pas "stats-cities") et un seul appel réseau, pas la
+        # peine de recalculer par ville si jamais étendu.
+        "intraday_trips": _compute_intraday_traffic(date) if city_id == "paris" else [],
         "generated_at": dt.datetime.utcnow().isoformat() + "Z",
         "model": model_used,
     }
