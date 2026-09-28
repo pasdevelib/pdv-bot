@@ -37,7 +37,11 @@ RELEASE_DIGEST = "daily-digest"
 RELEASE_STATS = "stats-cities"
 INDEX_MAX_ENTRIES = 90
 
-GEMINI_MODEL = "gemini-2.5-flash"
+# BUG CORRIGE ICI (2026-09-28) : gemini-2.5-flash n'est plus disponible
+# pour les nouveaux utilisateurs (HTTP 404, message d'erreur explicite de
+# l'API recommandant gemini-3.8-flash) — mis à jour vers le modèle
+# recommandé par Google au moment du premier run.
+GEMINI_MODEL = "gemini-3.8-flash"
 GEMINI_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 )
