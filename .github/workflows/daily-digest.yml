@@ -1,0 +1,39 @@
+name: daily-digest
+
+# Bilan quotidien du réseau, rédigé par Gemini, pour les 8 villes
+# (Paris + les 7 gérées par pdvr-bot). Tourne ici (pas dans pdvr-bot) car
+# la source de données — stats_<ville>_*.json, release "stats-cities" —
+# est déjà centralisée ici pour les 8 villes (voir stats-cities.yml).
+# Matrice + fail-fast: false = isolation par ville. Sortie publiée sur
+# blog.pasdevelib.app/blog/articles/dailymonitoring/<ville>.
+on:
+  schedule:
+    # 06:30 UTC, après stats-cities.yml (06:00)
+    - cron: '30 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  digest:
+    name: Digest ${{ matrix.city }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        city: [paris, bordeaux, lille, lyon, montpellier, nantes, rennes, strasbourg, toulouse]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install
+        run: pip install -e . requests
+      - name: Generate digest — ${{ matrix.city }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python -m pasdevelib.daily_digest --cities ${{ matrix.city }}

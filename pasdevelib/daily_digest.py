@@ -1,0 +1,284 @@
+"""daily_digest.py — Bilan quotidien du réseau, rédigé par IA (Gemini).
+
+Lit les données déjà calculées par stats_cities.py (release "stats-cities" :
+stats_<ville>_day.json, evolution_<ville>.json, records_<ville>.json,
+traffic_<ville>.json, weather_<ville>.json) pour les 8 villes (Paris
+inclus), les combine avec des repères mondiaux du secteur des vélos en
+libre-service (fourni statiquement ci-dessous, cf. discussion du
+2026-09-28 : ITDP, CIE — Cities in Europe —, Todd et al. 2021, movmi/ADL),
+et demande à Gemini de rédiger un bilan Markdown concis par ville.
+
+Sortie (release "daily-digest") :
+- digest_<ville>_<YYYY-MM-DD>.json : {date, city_id, title, description,
+  markdown, kpis} — une entrée par ville par jour
+- digest_<ville>_index.json : liste des 90 derniers jours publiés
+  (date, title, slug) — pour la page d'archive du blog
+
+Ne PAS committer de fichier dans pasdevelib-webapp (voir discussion) :
+la webapp lit ces assets en HTTP, exactement comme le reste des données
+du projet — aucun redeploy nécessaire pour publier un bilan.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import re
+import tempfile
+from pathlib import Path
+
+import requests
+
+from pasdevelib import storage
+from pasdevelib.cities import CITIES
+
+RELEASE_DIGEST = "daily-digest"
+RELEASE_STATS = "stats-cities"
+INDEX_MAX_ENTRIES = 90
+
+GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_URL = (
+    f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+)
+
+CITY_LABELS = {
+    "paris": "Paris", "bordeaux": "Bordeaux", "lyon": "Lyon", "toulouse": "Toulouse",
+    "lille": "Lille", "rennes": "Rennes", "strasbourg": "Strasbourg",
+    "montpellier": "Montpellier", "nantes": "Nantes",
+}
+
+# Repères mondiaux du secteur (VLS), condensés à partir des sources citées
+# dans la discussion du 2026-09-28 (Todd et al. 2021, CIE, ITDP, movmi/ADL,
+# NABSA, ISGlobal). Utilisés comme grille de lecture, jamais comme des
+# vérités absolues sur PasDeVélib — la note méthodo ci-dessous encadre ça.
+BENCHMARKS = """
+Repères mondiaux du secteur des vélos en libre-service (VLS), à citer
+UNIQUEMENT s'ils éclairent le chiffre du jour — jamais de façon plaquée :
+- Trajets par vélo et par jour (TDB) : 4 à 8 = fourchette optimale ITDP ;
+  6-12 pour un vélo électrique vs 1-5 pour un vélo mécanique (movmi/ADL).
+- Trajets par jour pour 1 000 habitants (benchmark européen CIE) : Paris
+  39,9 (référence), seuil d'excellence ~19, top 10 européen > 13.
+- Distance moyenne par trajet : 1 à 2,5 km (hypothèse prudente : 2 km).
+- Taux de stations avec au moins un vélo aux heures clés (8h, midi, 18h)
+  et taux de stations pleines : les deux mesures de la satisfaction usager.
+- Ratio bornes/vélos recommandé : 1,5 à 3 emplacements par vélo.
+- Temps de cycle de réparation best-in-class : moins de 4 jours.
+- Distance de marche acceptable jusqu'à une station : ~500 m.
+- CO2 évité : hypothèse 2 km/trajet substitué à une voiture.
+- Méthode de référence (baisse du compteur de vélos entre deux
+  observations) : erreur moyenne ~15% vs trajets réels — à rappeler
+  quand un nombre de trajets est cité.
+""".strip()
+
+PROMPT_TEMPLATE = """Tu es le rédacteur en chef data-journalisme du blog pasdevelib.app.
+Rédige le bilan quotidien du réseau de vélos en libre-service de {city_label}
+({network}), pour la journée du {date_human}, à partir des données réelles
+ci-dessous. Public : usagers curieux + collectivités/chercheurs qui suivent
+le site. Ton : factuel, précis, jamais promotionnel, jamais alarmiste sans
+preuve chiffrée.
+
+RÈGLES STRICTES :
+- Toute affirmation chiffrée doit venir des données fournies ci-dessous.
+  N'invente AUCUN chiffre. Si une donnée manque, dis-le plutôt que de combler.
+- Les "trajets estimés" sont une ESTIMATION par variation d'occupation
+  station par station (pas un comptage réel), marge d'erreur ~15% — le
+  rappeler la première fois que tu cites ce chiffre, brièvement.
+- Compare au maximum UN chiffre du jour à UN repère mondial pertinent
+  (liste ci-dessous), seulement si la comparaison est vraiment éclairante.
+  Ne pas forcer une comparaison si aucune n'est pertinente.
+- Pas de markdown avec des accolades { } ou de blocs de code — texte et
+  titres Markdown standards uniquement (#, ##, **, -, listes).
+- Longueur : 250 à 400 mots.
+
+{benchmarks}
+
+DONNÉES DU JOUR ({city_label}) :
+{data_json}
+
+FORMAT DE SORTIE ATTENDU (dans cet ordre, rien d'autre avant/après) :
+TITRE: <titre accrocheur avec la date, une ligne, sans guillemets>
+RESUME: <une phrase de résumé pour une carte/aperçu, 120 caractères max>
+---
+<corps de l'article en Markdown, commençant directement par le contenu,
+sans reprendre le titre en H1>
+"""
+
+
+def _download_json(release: str, asset: str) -> dict | None:
+    url = f"https://github.com/{storage.REPO}/releases/download/{release}/{asset}"
+    r = requests.get(url, timeout=30)
+    if r.status_code == 404:
+        return None
+    r.raise_for_status()
+    return r.json()
+
+
+def _gather_city_data(city_id: str) -> dict:
+    """Rassemble un sous-ensemble condensé des assets stats-cities déjà
+    calculés — pas de recalcul ici, uniquement de la lecture + un peu de
+    découpe pour ne pas envoyer des dizaines de Ko inutiles à Gemini."""
+    data: dict = {}
+
+    day_stats = _download_json(RELEASE_STATS, f"stats_{city_id}_day.json")
+    if day_stats:
+        data["remplissage_moyen"] = day_stats.get("city_avg_fill_rate")
+        data["stations_top_vides"] = (day_stats.get("top_empty") or [])[:5]
+        data["stations_top_pleines"] = (day_stats.get("top_full") or [])[:5]
+        data["quartiers_les_plus_touches"] = (day_stats.get("neighborhoods") or [])[:5]
+        data["fenetre"] = {"debut": day_stats.get("window_start"), "fin": day_stats.get("window_end")}
+
+    evolution = _download_json(RELEASE_STATS, f"evolution_{city_id}.json")
+    if evolution and evolution.get("series"):
+        data["evolution_7_derniers_jours"] = evolution["series"][-7:]
+
+    traffic = _download_json(RELEASE_STATS, f"traffic_{city_id}.json")
+    if traffic and traffic.get("trips_per_day"):
+        last = traffic["trips_per_day"][-1]
+        data["trajets_estimes_hier"] = last
+        data["profil_horaire_departs"] = traffic.get("bikes_per_hour")
+
+    records = _download_json(RELEASE_STATS, f"records_{city_id}.json")
+    if records:
+        data["records"] = records
+
+    weather = _download_json(RELEASE_STATS, f"weather_{city_id}.json")
+    if weather and weather.get("ready"):
+        data["impact_meteo"] = weather
+
+    stuck = _download_json(RELEASE_STATS, f"stuck_{city_id}.json")
+    if stuck:
+        data["stations_bloquees"] = {
+            "vides_longtemps": (stuck.get("longest_empty") or [])[:3],
+            "pleines_longtemps": (stuck.get("longest_full") or [])[:3],
+        }
+
+    return data
+
+
+def _call_gemini(prompt: str, api_key: str) -> str:
+    r = requests.post(
+        f"{GEMINI_URL}?key={api_key}",
+        headers={"Content-Type": "application/json"},
+        json={
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 0.6, "maxOutputTokens": 2000},
+        },
+        timeout=60,
+    )
+    r.raise_for_status()
+    payload = r.json()
+    candidates = payload.get("candidates") or []
+    if not candidates:
+        raise RuntimeError(f"Gemini n'a renvoyé aucune réponse exploitable: {payload}")
+    parts = candidates[0].get("content", {}).get("parts", [])
+    text = "".join(p.get("text", "") for p in parts)
+    if not text.strip():
+        raise RuntimeError("Gemini a renvoyé une réponse vide")
+    return text
+
+
+def _parse_gemini_output(raw: str) -> tuple[str, str, str]:
+    """Extrait (titre, résumé, corps markdown) du format attendu.
+    Défensif : si Gemini ne respecte pas exactement le format, on
+    dégrade proprement plutôt que de planter tout le run."""
+    m = re.search(
+        r"TITRE:\s*(.+?)\nRESUME:\s*(.+?)\n---\n(.*)",
+        raw.strip(), re.DOTALL,
+    )
+    if not m:
+        # Dégradé : pas de titre structuré trouvé, on prend tout comme corps.
+        return "Bilan du jour", raw.strip()[:120], raw.strip()
+    title, summary, body = m.group(1).strip(), m.group(2).strip(), m.group(3).strip()
+    # Defensif : aucune accolade dans le markdown (voir PROMPT_TEMPLATE) —
+    # MDXRemote côté webapp interprète { } comme du JSX.
+    body = body.replace("{", "(").replace("}", ")")
+    return title, summary, body
+
+
+def run_city(city_id: str, api_key: str, date: dt.date) -> None:
+    city_cfg = CITIES.get(city_id)
+    city_label = CITY_LABELS.get(city_id, city_id.capitalize())
+    network = city_cfg.system_name if city_cfg else city_label
+
+    data = _gather_city_data(city_id)
+    if not data:
+        print(f"[daily_digest] {city_id}: aucune donnée stats-cities disponible, skip")
+        return
+
+    date_human = date.strftime("%d/%m/%Y")
+    prompt = PROMPT_TEMPLATE.format(
+        city_label=city_label,
+        network=network,
+        date_human=date_human,
+        benchmarks=BENCHMARKS,
+        data_json=json.dumps(data, ensure_ascii=False, indent=2, default=str),
+    )
+
+    raw = _call_gemini(prompt, api_key)
+    title, summary, body = _parse_gemini_output(raw)
+
+    date_str = date.isoformat()
+    entry = {
+        "date": date_str,
+        "city_id": city_id,
+        "title": title,
+        "description": summary,
+        "markdown": body,
+        "generated_at": dt.datetime.utcnow().isoformat() + "Z",
+        "model": GEMINI_MODEL,
+    }
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        asset_name = f"digest_{city_id}_{date_str}.json"
+        out_path = tmp_dir / asset_name
+        out_path.write_text(json.dumps(entry, ensure_ascii=False, indent=2))
+        storage.upload_asset(RELEASE_DIGEST, out_path, asset_name)
+
+        # Index (liste des N derniers jours) — lu par la page d'archive
+        # /blog/articles/dailymonitoring/<ville> côté webapp.
+        index_name = f"digest_{city_id}_index.json"
+        index_path = tmp_dir / index_name
+        existing = storage.download_asset(RELEASE_DIGEST, index_name, index_path)
+        entries = json.loads(index_path.read_text()) if existing and index_path.exists() else []
+        entries = [e for e in entries if e.get("date") != date_str]
+        entries.append({"date": date_str, "title": title, "description": summary})
+        entries.sort(key=lambda e: e["date"], reverse=True)
+        entries = entries[:INDEX_MAX_ENTRIES]
+        index_path.write_text(json.dumps(entries, ensure_ascii=False, indent=2))
+        storage.upload_asset(RELEASE_DIGEST, index_path, index_name)
+
+    print(f"[daily_digest] {city_id}: {asset_name} publié ({title})")
+
+
+def run(city_ids: list[str] | None = None) -> None:
+    import os
+
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY absente")
+
+    if city_ids is None:
+        city_ids = list(CITY_LABELS.keys())
+
+    storage.ensure_release(RELEASE_DIGEST, "Bilans quotidiens par ville (rédigés par IA)")
+
+    # Le bilan porte sur la journée d'hier (le run de 06h30 UTC ne voit
+    # pas encore la journée en cours), même logique que stats_day.
+    yesterday = dt.datetime.utcnow().date() - dt.timedelta(days=1)
+
+    for city_id in city_ids:
+        # Isolation par ville, même principe que consolidate_cities.py :
+        # un échec (Gemini, données manquantes) ne bloque jamais les autres.
+        try:
+            run_city(city_id, api_key, yesterday)
+        except Exception as e:
+            print(f"[daily_digest] {city_id}: ECHEC ({e}) — villes suivantes non affectées")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--cities", nargs="+", default=None,
+                        help="IDs des villes (ex: paris bordeaux). Défaut: les 8.")
+    args = parser.parse_args()
+    run(args.cities)
