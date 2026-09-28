@@ -21,6 +21,8 @@ Schema de sortie principal (stats_<ville>_<periode>.json, release
   "city_id", "period" ("day"|"week"|"month"),
   "generated_at", "window_start", "window_end",
   "city_avg_fill_rate": float,
+  "ebike_share": float | null,  # part electrique du parc dispo (0-1)
+  "hourly_curve": [{hour: 0-23, avg_fill_rate}, ...],  # profil horaire
   "top_empty":      [{station_id, name, pct_empty, n_obs}, ...] (20 max)
   "top_full":       [{station_id, name, pct_full,  n_obs}, ...] (20 max)
   "most_reliable":  [{station_id, name, pct_healthy, n_obs}, ...] (20 max)
@@ -168,6 +170,47 @@ def _rank_zones(window: pd.DataFrame, zones: dict[str, str]) -> list[dict] | Non
     ]
 
 
+def _compute_ebike_share(window: pd.DataFrame) -> float | None:
+    """Part des vélos disponibles qui sont électriques (0-1), tous
+    horodatages de la fenêtre confondus. Deux schémas coexistent selon la
+    ville (cf. consolidate.py vs consolidate_cities.py) :
+    - Paris (aggregate.py) : colonnes fill_rate_ebike/fill_rate_mechanical
+      (des ratios /capacité) — la part s'obtient directement par le
+      rapport des deux moyennes (la capacité s'annule).
+    - Villes régionales (consolidate_cities.py) : colonnes brutes
+      num_bikes_ebike/num_bikes_mechanical — part = somme ebike / somme
+      des deux.
+    Renvoie None si aucune des deux paires n'est présente (historique
+    ancien) plutôt qu'une fausse valeur à 0.
+    """
+    if "fill_rate_ebike" in window.columns and "fill_rate_mechanical" in window.columns:
+        ebike = window["fill_rate_ebike"].mean()
+        mechanical = window["fill_rate_mechanical"].mean()
+    elif "num_bikes_ebike" in window.columns and "num_bikes_mechanical" in window.columns:
+        ebike = window["num_bikes_ebike"].sum()
+        mechanical = window["num_bikes_mechanical"].sum()
+    else:
+        return None
+    total = ebike + mechanical
+    if not total or pd.isna(total) or total <= 0:
+        return None
+    return round(float(ebike / total), 3)
+
+
+def _compute_hourly_curve(window: pd.DataFrame) -> list[dict]:
+    """Remplissage moyen par heure (0-23) sur la fenêtre — permet une
+    courbe "profil sur 24h" même quand la fenêtre couvre plusieurs jours
+    (moyenne par heure-du-jour, pas un vrai historique continu dans ce
+    cas ; pour period="day" les deux se confondent)."""
+    if "hour" not in window.columns or window.empty:
+        return []
+    by_hour = window.groupby("hour")["fill_rate"].mean().reset_index().sort_values("hour")
+    return [
+        {"hour": int(row.hour), "avg_fill_rate": round(float(row.fill_rate), 3)}
+        for row in by_hour.itertuples()
+    ]
+
+
 def compute_period(hourly: pd.DataFrame, names: dict[str, str], zones: dict[str, str], days: int) -> dict:
     hourly = hourly.copy()
     hourly["date"] = pd.to_datetime(hourly["date"])
@@ -199,6 +242,12 @@ def compute_period(hourly: pd.DataFrame, names: dict[str, str], zones: dict[str,
         # seulement le top 20) — sert de score comparable entre villes
         # ("quel reseau est le plus fiable ?"), cf. page Donnees.
         "city_avg_pct_healthy": round(float(eligible["pct_healthy"].mean()), 3) if not eligible.empty else None,
+        # AJOUTE (2026-09-28, demande Théo) : part électrique du parc
+        # disponible + profil horaire, pour enrichir les cartes du bilan
+        # quotidien (voir daily_digest.py) — None/[] si les colonnes
+        # sources n'existent pas encore pour cette ville.
+        "ebike_share": _compute_ebike_share(window),
+        "hourly_curve": _compute_hourly_curve(window),
         "top_empty": _rank(eligible, "pct_empty", "pct_empty", names),
         "top_full": _rank(eligible, "pct_full", "pct_full", names),
         "most_reliable": _rank(eligible, "pct_healthy", "pct_healthy", names),

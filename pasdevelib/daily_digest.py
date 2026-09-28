@@ -84,6 +84,12 @@ UNIQUEMENT s'ils éclairent le chiffre du jour — jamais de façon plaquée :
   quand un nombre de trajets est cité.
 """.strip()
 
+# RESTRUCTURE (2026-09-28, demande Théo) : sortie JSON stricte plutot que
+# TITRE/RESUME/--- — plus facile a exploiter cote template (cartes "points
+# cles", encart "conseil du jour" separement du corps narratif) sans
+# reparser un bloc de texte libre. La structure du corps (pointe matin vs
+# soir, top/flop stations, analyse meteo) est desormais imposee dans les
+# regles plutot que laissee au libre choix du modele.
 PROMPT_TEMPLATE = """Tu es le rédacteur en chef data-journalisme du blog pasdevelib.app.
 Rédige le bilan quotidien du réseau de vélos en libre-service de {city_label}
 ({network}), pour la journée du {date_human}, à partir des données réelles
@@ -93,28 +99,48 @@ preuve chiffrée.
 
 RÈGLES STRICTES :
 - Toute affirmation chiffrée doit venir des données fournies ci-dessous.
-  N'invente AUCUN chiffre. Si une donnée manque, dis-le plutôt que de combler.
+  N'invente AUCUN chiffre. Si une donnée manque, dis-le plutôt que de combler
+  (et NE MENTIONNE PAS la section correspondante si les données sont vides).
 - Les "trajets estimés" sont une ESTIMATION par variation d'occupation
   station par station (pas un comptage réel), marge d'erreur ~15% — le
   rappeler la première fois que tu cites ce chiffre, brièvement.
 - Compare au maximum UN chiffre du jour à UN repère mondial pertinent
   (liste ci-dessous), seulement si la comparaison est vraiment éclairante.
   Ne pas forcer une comparaison si aucune n'est pertinente.
-- Pas de markdown avec des accolades ou de blocs de code — texte et
-  titres Markdown standards uniquement (#, ##, **, -, listes).
-- Longueur : 250 à 400 mots.
+- "corps_markdown" : markdown standard uniquement, sans accolades ni blocs
+  de code, structuré dans cet ordre :
+  1. Un paragraphe d'ouverture avec le chiffre du jour (remplissage moyen).
+  2. Si profil_horaire_departs contient des heures 6h-10h ET 16h-20h avec
+     des données : un paragraphe séparant la pointe du matin de la pointe
+     du soir (deux flux distincts). Sinon, un seul paragraphe sur le pic
+     observé, sans forcer une distinction matin/soir inexistante dans les
+     données.
+  3. Si stations_top_vides ou stations_top_pleines est non vide : un
+     paragraphe nommant les stations concernées.
+  4. Si impact_meteo est présent : un paragraphe croisant pluie et trafic.
+  Longueur du corps : 250 à 400 mots.
+- "points_cles" : 3 à 5 puces courtes (une phrase chacune), les faits les
+  plus marquants du jour — pas un résumé du corps, des chiffres bruts
+  autonomes (ex: "Pic de départs à 8h avec 590 vélos/h").
+- "conseil_usager" : UNE phrase pratique et actionnable pour un usager,
+  basée sur une donnée réelle ci-dessous (ex: une station ou un horaire à
+  éviter/privilégier). Si aucune donnée ne permet un conseil honnête,
+  renvoie une chaîne vide "" plutôt que d'inventer.
 
 {benchmarks}
 
 DONNÉES DU JOUR ({city_label}) :
 {data_json}
 
-FORMAT DE SORTIE ATTENDU (dans cet ordre, rien d'autre avant/après) :
-TITRE: <titre accrocheur avec la date, une ligne, sans guillemets>
-RESUME: <une phrase de résumé pour une carte/aperçu, 120 caractères max>
----
-<corps de l'article en Markdown, commençant directement par le contenu,
-sans reprendre le titre en H1>
+Réponds UNIQUEMENT avec un objet JSON valide (aucun texte avant/après,
+aucun bloc de code ```), exactement ce schéma :
+{{
+  "titre": "<titre accrocheur avec la date, une ligne, sans guillemets>",
+  "chapeau": "<une phrase de résumé pour une carte/aperçu, 160 caractères max>",
+  "points_cles": ["<fait 1>", "<fait 2>", "<fait 3>"],
+  "conseil_usager": "<conseil actionnable, ou chaîne vide>",
+  "corps_markdown": "<corps de l'article en Markdown, structuré selon les règles ci-dessus, sans reprendre le titre en H1>"
+}}
 """
 
 
@@ -140,6 +166,14 @@ def _gather_city_data(city_id: str) -> dict:
         data["stations_top_pleines"] = (day_stats.get("top_full") or [])[:5]
         data["quartiers_les_plus_touches"] = (day_stats.get("neighborhoods") or [])[:5]
         data["fenetre"] = {"debut": day_stats.get("window_start"), "fin": day_stats.get("window_end")}
+        # AJOUTE (2026-09-28, demande Théo) : part électrique du parc dispo
+        # et profil horaire — calculés par stats_cities.py (compute_period).
+        # None/[] si pas encore dispo pour cette ville (voir docstring de
+        # _compute_ebike_share/_compute_hourly_curve dans stats_cities.py).
+        if day_stats.get("ebike_share") is not None:
+            data["part_electrique"] = day_stats["ebike_share"]
+        if day_stats.get("hourly_curve"):
+            data["profil_horaire_remplissage"] = day_stats["hourly_curve"]
 
     evolution = _download_json(RELEASE_STATS, f"evolution_{city_id}.json")
     if evolution and evolution.get("series"):
@@ -291,22 +325,64 @@ def _call_mistral(prompt: str, api_key: str) -> str:
     raise last_error or RuntimeError(f"Mistral: échec après {MAX_GEMINI_ATTEMPTS} tentatives")
 
 
-def _parse_gemini_output(raw: str) -> tuple[str, str, str]:
-    """Extrait (titre, résumé, corps markdown) du format attendu.
-    Défensif : si Gemini ne respecte pas exactement le format, on
-    dégrade proprement plutôt que de planter tout le run."""
-    m = re.search(
-        r"TITRE:\s*(.+?)\nRESUME:\s*(.+?)\n---\n(.*)",
-        raw.strip(), re.DOTALL,
-    )
-    if not m:
-        # Dégradé : pas de titre structuré trouvé, on prend tout comme corps.
-        return "Bilan du jour", raw.strip()[:120], raw.strip()
-    title, summary, body = m.group(1).strip(), m.group(2).strip(), m.group(3).strip()
-    # Defensif : aucune accolade dans le markdown (voir PROMPT_TEMPLATE) —
-    # MDXRemote côté webapp interprète { } comme du JSX.
-    body = body.replace("{", "(").replace("}", ")")
-    return title, summary, body
+def _strip_code_fence(text: str) -> str:
+    """Retire un eventuel encadrement ```json ... ``` autour de la reponse —
+    frequent malgre la consigne "aucun bloc de code" du prompt."""
+    text = text.strip()
+    text = re.sub(r"^```(?:json)?\s*", "", text)
+    text = re.sub(r"\s*```$", "", text)
+    return text.strip()
+
+
+def _parse_json_output(raw: str) -> dict:
+    """Extrait le JSON structure (titre/chapeau/points_cles/conseil_usager/
+    corps_markdown) de la reponse du modele. Defensif a plusieurs niveaux
+    (meme esprit que l'ancien parseur texte, cf. historique de ce fichier) :
+    - retire un encadrement ```json``` eventuel
+    - si du texte parasite entoure quand meme le JSON, prend la sous-chaine
+      du premier '{' au dernier '}'
+    - si le JSON est invalide ou incomplet, degrade proprement plutot que
+      de planter tout le run (une ville en echec ne doit jamais bloquer
+      les suivantes, cf. run())
+    """
+    text = _strip_code_fence(raw)
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return {
+            "titre": "Bilan du jour",
+            "chapeau": text[:160],
+            "points_cles": [],
+            "conseil_usager": "",
+            "corps_markdown": text,
+        }
+    try:
+        payload = json.loads(text[start:end + 1])
+    except json.JSONDecodeError:
+        return {
+            "titre": "Bilan du jour",
+            "chapeau": text[:160],
+            "points_cles": [],
+            "conseil_usager": "",
+            "corps_markdown": text,
+        }
+
+    def _clean_markdown(s: str) -> str:
+        # Defensif : aucune accolade dans le markdown — MDXRemote côté
+        # webapp interprète { } comme du JSX (bug déjà rencontré ici).
+        return str(s).replace("{", "(").replace("}", ")").strip()
+
+    points_cles = payload.get("points_cles")
+    if not isinstance(points_cles, list):
+        points_cles = []
+    points_cles = [_clean_markdown(p) for p in points_cles if str(p).strip()][:5]
+
+    return {
+        "titre": _clean_markdown(payload.get("titre") or "Bilan du jour"),
+        "chapeau": _clean_markdown(payload.get("chapeau") or "")[:160],
+        "points_cles": points_cles,
+        "conseil_usager": _clean_markdown(payload.get("conseil_usager") or ""),
+        "corps_markdown": _clean_markdown(payload.get("corps_markdown") or ""),
+    }
 
 
 def _api_key_env_var(city_id: str) -> str:
@@ -354,15 +430,24 @@ def run_city(city_id: str, date: dt.date) -> None:
     else:
         raw = _call_gemini(prompt, gemini_key)
         model_used = GEMINI_MODEL
-    title, summary, body = _parse_gemini_output(raw)
+    parsed = _parse_json_output(raw)
 
     date_str = date.isoformat()
     entry = {
         "date": date_str,
         "city_id": city_id,
-        "title": title,
-        "description": summary,
-        "markdown": body,
+        "title": parsed["titre"],
+        "description": parsed["chapeau"],
+        "markdown": parsed["corps_markdown"],
+        # AJOUTE (2026-09-28, demande Théo) : sortie JSON structurée plutot
+        # que TITRE/RESUME/--- — champs additifs, la version prod actuelle
+        # du template (qui ne lit que title/description/markdown) continue
+        # de fonctionner sans modif si elle est publiée avant que le
+        # template les affiche.
+        "points_cles": parsed["points_cles"],
+        "conseil_usager": parsed["conseil_usager"],
+        "ebike_share": data.get("part_electrique"),
+        "hourly_curve": data.get("profil_horaire_remplissage", []),
         "generated_at": dt.datetime.utcnow().isoformat() + "Z",
         "model": model_used,
     }
