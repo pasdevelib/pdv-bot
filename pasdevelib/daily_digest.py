@@ -569,13 +569,22 @@ def run_city(city_id: str, date: dt.date) -> None:
         existing = storage.download_asset(RELEASE_DIGEST, index_name, index_path)
         entries = json.loads(index_path.read_text()) if existing and index_path.exists() else []
         entries = [e for e in entries if e.get("date") != date_str]
-        entries.append({"date": date_str, "title": title, "description": summary})
+        # BUG CORRIGE ICI (2026-09-28) : `title`/`summary` n'existaient plus
+        # depuis le passage à la sortie JSON structurée (parsed["titre"]/
+        # parsed["chapeau"]) — NameError qui plantait run_city() APRES
+        # l'upload de digest_<ville>_<date>.json mais AVANT la mise à jour de
+        # l'index, silencieusement absorbé par le try/except par-ville dans
+        # run(). Résultat : le digest du jour était bien publié, mais
+        # l'index (utilisé par fetchLatestDigest côté webapp) restait bloqué
+        # sur l'ancien digest le plus récent — d'où la page qui semblait ne
+        # jamais se mettre à jour malgré des runs "réussis".
+        entries.append({"date": date_str, "title": entry["title"], "description": entry["description"]})
         entries.sort(key=lambda e: e["date"], reverse=True)
         entries = entries[:INDEX_MAX_ENTRIES]
         index_path.write_text(json.dumps(entries, ensure_ascii=False, indent=2))
         storage.upload_asset(RELEASE_DIGEST, index_path, index_name)
 
-    print(f"[daily_digest] {city_id}: {asset_name} publié ({title})")
+    print(f"[daily_digest] {city_id}: {asset_name} publié ({entry['title']})")
 
 
 def run(city_ids: list[str] | None = None) -> None:
