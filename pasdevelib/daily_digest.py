@@ -177,6 +177,12 @@ def _gather_city_data(city_id: str) -> dict:
 #    meme fenetre glissante.
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 _RETRY_AFTER_RE = re.compile(r"retry in (\d+(?:\.\d+)?)s", re.IGNORECASE)
+# gemini-3.8-flash est un modele recemment sorti et tres demande ; un 503
+# "high demand" peut durer largement plus que les ~7s que couvrait l'ancien
+# backoff (4 tentatives, plafond 2**attempt). On monte a 6 tentatives avec un
+# plafond de 60s, ce qui laisse ~2min de marge cumulee avant d'abandonner.
+MAX_GEMINI_ATTEMPTS = 6
+_MAX_BACKOFF_S = 60.0
 
 
 def _call_gemini(prompt: str, api_key: str) -> str:
@@ -184,7 +190,7 @@ def _call_gemini(prompt: str, api_key: str) -> str:
     import time
 
     last_error: Exception | None = None
-    for attempt in range(4):
+    for attempt in range(MAX_GEMINI_ATTEMPTS):
         r = requests.post(
             f"{GEMINI_URL}?key={api_key}",
             headers={"Content-Type": "application/json"},
@@ -199,10 +205,14 @@ def _call_gemini(prompt: str, api_key: str) -> str:
             # quota depasse, contenu bloque...) — raise_for_status() seul ne
             # le montre pas, d'ou des erreurs illisibles dans les logs Actions.
             last_error = RuntimeError(f"Gemini HTTP {r.status_code}: {r.text[:500]}")
-            if r.status_code in RETRYABLE_STATUS and attempt < 3:
+            if r.status_code in RETRYABLE_STATUS and attempt < MAX_GEMINI_ATTEMPTS - 1:
                 m = _RETRY_AFTER_RE.search(r.text)
-                wait = float(m.group(1)) + 2.0 if m else (2 ** attempt) + random.uniform(0, 1.5)
-                print(f"[daily_digest] Gemini HTTP {r.status_code} (tentative {attempt + 1}/4), "
+                wait = (
+                    float(m.group(1)) + 2.0 if m
+                    else min(_MAX_BACKOFF_S, (2 ** attempt) + random.uniform(0, 1.5))
+                )
+                print(f"[daily_digest] Gemini HTTP {r.status_code} "
+                      f"(tentative {attempt + 1}/{MAX_GEMINI_ATTEMPTS}), "
                       f"nouvel essai dans {wait:.1f}s"
                       + (" (delai indique par l'API)" if m else ""))
                 time.sleep(wait)
