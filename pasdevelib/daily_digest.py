@@ -404,17 +404,36 @@ def _parse_json_output(raw: str) -> dict:
     }
 
 
-def _compute_intraday_traffic(date: dt.date) -> list[dict]:
-    """Départs estimés par tranche de 10 minutes sur LA journée du bilan,
-    à partir de l'archive brute (release "history", YYYY-MM-DD.parquet)
-    qui garde chaque relevé individuel — contrairement à
-    hourly_history.parquet (déjà agrégé à l'heure), seule cette
-    granularité permet un découpage à 10 min.
+def _download_day_archive(date: dt.date) -> pd.DataFrame | None:
+    """Télécharge l'archive brute d'UNE journée (release "history",
+    YYYY-MM-DD.parquet, écrite par consolidate.py) — chaque relevé
+    individuel du scraper, contrairement à hourly_history.parquet
+    (release "aggregates") déjà agrégé à l'heure. C'est cette granularité
+    fine qui permet un découpage à 10 min (_compute_intraday_traffic) ou
+    un flux heure par heure sur UN jour précis (_compute_station_hourly_flux).
 
     Paris UNIQUEMENT pour l'instant : seul pdv-bot/consolidate.py archive
-    ce fichier brut par jour (cf. son docstring). pdvr-bot (villes
-    régionales) agrège directement à l'heure sans étape intermédiaire —
-    donc [] pour elles tant que ce n'est pas changé côté pipeline.
+    ce fichier brut par jour. pdvr-bot (villes régionales) agrège
+    directement à l'heure sans étape intermédiaire — donc None pour elles
+    tant que ce n'est pas changé côté pipeline.
+
+    Partagée entre les deux fonctions plutôt que téléchargée deux fois
+    (même fichier, ~30s de download) — chacune part ensuite de sa propre
+    copie (df.copy() en interne si besoin) pour ne pas se marcher dessus.
+    """
+    date_str = date.isoformat()
+    url = f"https://github.com/{storage.REPO}/releases/download/history/{date_str}.parquet"
+    r = requests.get(url, timeout=30)
+    if r.status_code != 200:
+        return None
+    df = pd.read_parquet(io.BytesIO(r.content))
+    if df.empty or "fetched_at" not in df.columns:
+        return None
+    return df
+
+
+def _compute_intraday_traffic(date: dt.date, day_df: pd.DataFrame | None = None) -> list[dict]:
+    """Départs estimés par tranche de 10 minutes sur LA journée du bilan.
 
     Même méthodologie que compute_traffic() dans stats_cities.py (seules
     les BAISSES comptent comme "départs", plafond par-station au
@@ -425,15 +444,15 @@ def _compute_intraday_traffic(date: dt.date) -> list[dict]:
     Renvoie une liste de 144 tranches (00:00 à 23:50). "trips"/"cumulative"
     sont None pour une tranche jamais couverte par le scraper (au lieu
     d'un faux 0) — le pipeline a des trous connus (cf. README pdv-bot).
+
+    day_df : archive déjà téléchargée par _download_day_archive(), pour
+    éviter un second download quand run_city() a déjà besoin du flux
+    horaire (_compute_station_hourly_flux) pour la même date.
     """
-    date_str = date.isoformat()
-    url = f"https://github.com/{storage.REPO}/releases/download/history/{date_str}.parquet"
-    r = requests.get(url, timeout=30)
-    if r.status_code != 200:
+    df = day_df if day_df is not None else _download_day_archive(date)
+    if df is None:
         return []
-    df = pd.read_parquet(io.BytesIO(r.content))
-    if df.empty or "fetched_at" not in df.columns:
-        return []
+    df = df.copy()
 
     df["fetched_at"] = pd.to_datetime(df["fetched_at"], utc=True)
     local_ts = df["fetched_at"].dt.tz_convert("Europe/Paris")
@@ -442,13 +461,25 @@ def _compute_intraday_traffic(date: dt.date) -> list[dict]:
 
     per_bucket = (
         df.sort_values("fetched_at")
-        .groupby(["station_id", "bucket_min"], as_index=False)["num_bikes_available"]
-        .last()
+        .groupby(["station_id", "bucket_min"], as_index=False)
+        .agg(num_bikes_available=("num_bikes_available", "last"), fetched_at=("fetched_at", "last"))
         .sort_values(["station_id", "bucket_min"])
     )
-    per_bucket["prev_bucket"] = per_bucket.groupby("station_id")["bucket_min"].shift(1)
     per_bucket["prev_bikes"] = per_bucket.groupby("station_id")["num_bikes_available"].shift(1)
-    is_consecutive = (per_bucket["bucket_min"] - per_bucket["prev_bucket"]) == 10
+    prev_fetched_at = per_bucket.groupby("station_id")["fetched_at"].shift(1)
+    # BUG EVITE ICI (2026-09-28) : l'archive history/<date>.parquet est
+    # bornée sur la date UTC, donc convertie en heure locale Paris (+1/+2h)
+    # elle couvre les heures locales ~1h/2h→23h59 du jour D PUIS 00h/01h du
+    # jour D+1. Comparer les bucket_min entre eux (ex. l'ancien
+    # `bucket_min - prev_bucket == 10`) traite alors le dernier bucket local
+    # avant minuit (23h50, vrai) et le premier bucket local après minuit
+    # (00h00, en réalité ~22h plus tôt dans l'archive UTC précédente) comme
+    # "consécutifs" puisque 0-1430 se suivent numériquement — ce qui produit
+    # un pic de "départs" fantôme à cette jointure. On compare desormais le
+    # VRAI temps écoulé entre les deux relevés (fetched_at réel), qui démasque
+    # ce saut (~22h, largement hors tolérance) sans toucher au reste.
+    elapsed_min = (per_bucket["fetched_at"] - prev_fetched_at).dt.total_seconds() / 60
+    is_consecutive = elapsed_min.between(0, 15, inclusive="right")
     delta = per_bucket["num_bikes_available"] - per_bucket["prev_bikes"]
     departures = (-delta).clip(lower=0)
     per_bucket["departures"] = departures.where(is_consecutive, other=np.nan)
@@ -476,6 +507,115 @@ def _compute_intraday_traffic(date: dt.date) -> list[dict]:
             "cumulative": round(cumulative) if has_data else None,
         })
     return result
+
+
+def _fetch_stations_meta() -> dict:
+    """station_id -> {name, lat, lon, capacity}, depuis stations.json
+    (release "live"). Même logique que _build_stations_meta() dans
+    flux.py — dupliquée plutôt qu'importée pour ne pas coupler ce module
+    à flux.py (déclenché par un workflow séparé), cf. le même choix pour
+    _compute_intraday_traffic vs compute_traffic().
+    """
+    url = f"https://github.com/{storage.REPO}/releases/download/{storage.RELEASE_LIVE}/stations.json"
+    r = requests.get(url, timeout=30)
+    if r.status_code != 200:
+        return {}
+    out = {}
+    for s in r.json():
+        sid = str(s.get("station_id") or s.get("stationcode") or s.get("stationCode") or "")
+        if not sid:
+            continue
+        lat, lon = s.get("lat") or s.get("latitude"), s.get("lon") or s.get("longitude")
+        if lat is None or lon is None:
+            continue
+        out[sid] = {
+            "name": s.get("name") or s.get("station_name") or "",
+            "lat": float(lat),
+            "lon": float(lon),
+            "capacity": int(s.get("capacity", 0) or 0),
+        }
+    return out
+
+
+def _compute_station_hourly_flux(
+    date: dt.date, day_df: pd.DataFrame | None, stations_meta: dict
+) -> dict | None:
+    """Flux net par station, heure par heure, pour LA journée précise du
+    bilan (contrairement à flux.py/flux_hourly.json qui moyenne sur tout
+    l'historique disponible pour un jour-de-semaine donné — cf. discussion
+    du 2026-09-28 : "il faut une heatmap ... qui défile tout seul de 00h à
+    23h59" sur le jour du bilan, pas la version moyennée à curseur manuel
+    de /blog/articles/respiration-paris).
+
+    Même formule que respiration-paris (flux_net(station, h) = bikes(h) -
+    bikes(h-1)) mais sur les relevés bruts d'un seul jour au lieu d'une
+    moyenne multi-jours. Contrairement à flux.py, les heures de nuit (0-5h)
+    ne sont PAS masquées : ici on montre le vrai déroulé du jour, y compris
+    un éventuel rééquilibrage nocturne — c'est un instantané réel, pas une
+    moyenne à "nettoyer".
+
+    Paris uniquement (mêmes limites que _compute_intraday_traffic).
+    Publié à part (asset daymap_<ville>_<date>.json) plutôt que dans
+    l'entrée digest_<ville>_<date>.json : ~1500 stations × 24h, plus gros
+    qu'un digest et consommé différemment (par la carte, pas l'article).
+    """
+    df = day_df if day_df is not None else _download_day_archive(date)
+    if df is None or not stations_meta:
+        return None
+    df = df.copy()
+
+    df["fetched_at"] = pd.to_datetime(df["fetched_at"], utc=True)
+    local_ts = df["fetched_at"].dt.tz_convert("Europe/Paris")
+    df["hour"] = local_ts.dt.hour
+    df["station_id"] = df["station_id"].astype(str)
+
+    per_hour = (
+        df.sort_values("fetched_at")
+        .groupby(["station_id", "hour"], as_index=False)
+        .agg(num_bikes_available=("num_bikes_available", "last"), fetched_at=("fetched_at", "last"))
+        .sort_values(["station_id", "hour"])
+    )
+    per_hour["prev_bikes"] = per_hour.groupby("station_id")["num_bikes_available"].shift(1)
+    prev_fetched_at = per_hour.groupby("station_id")["fetched_at"].shift(1)
+    # Même garde-fou que _compute_intraday_traffic (cf. son commentaire) :
+    # temps réel écoulé plutôt que différence d'étiquette d'heure locale,
+    # pour ne pas confondre 23h(jour D)→0h(jour D+1) avec 22h(D)→23h(D).
+    elapsed_min = (per_hour["fetched_at"] - prev_fetched_at).dt.total_seconds() / 60
+    is_consecutive = elapsed_min.between(0, 90, inclusive="right")
+    delta = per_hour["num_bikes_available"] - per_hour["prev_bikes"]
+    per_hour["flux"] = delta.where(is_consecutive, other=np.nan)
+
+    flux_by_station = {
+        sid: dict(zip(g["hour"], g["flux"]))
+        for sid, g in per_hour.groupby("station_id")
+    }
+
+    stations_out = []
+    for sid, info in stations_meta.items():
+        hourly = flux_by_station.get(sid)
+        if not hourly:
+            continue
+        arr = []
+        for h in range(24):
+            v = hourly.get(h)
+            arr.append(round(float(v), 1) if v is not None and v == v else None)
+        if all(v is None for v in arr):
+            continue
+        stations_out.append({
+            "id": sid,
+            "name": info.get("name", ""),
+            "lat": info["lat"],
+            "lon": info["lon"],
+            "capacity": info.get("capacity", 0),
+            "flux": arr,
+        })
+
+    return {
+        "date": date.isoformat(),
+        "generated_at": dt.datetime.utcnow().isoformat() + "Z",
+        "n_stations": len(stations_out),
+        "stations": stations_out,
+    }
 
 
 def _api_key_env_var(city_id: str) -> str:
@@ -546,14 +686,29 @@ def run_city(city_id: str, date: dt.date) -> None:
         "n_stations_empty_all_day": data.get("n_stations_vides_toute_la_journee", 0),
         "top_tension": data.get("stations_top_tension", []),
         # Départs par tranche de 10 min sur la journée du bilan — Paris
-        # uniquement pour l'instant (cf. docstring de la fonction). Appel
-        # séparé de _gather_city_data() : source différente (archive brute
-        # "history", pas "stats-cities") et un seul appel réseau, pas la
-        # peine de recalculer par ville si jamais étendu.
-        "intraday_trips": _compute_intraday_traffic(date) if city_id == "paris" else [],
+        # uniquement pour l'instant (cf. docstring de la fonction). Un seul
+        # download de l'archive brute (day_archive, ci-dessous), partagé
+        # avec le calcul du flux horaire par station juste après — pas la
+        # peine de retélécharger le même fichier deux fois.
+        "intraday_trips": [],
         "generated_at": dt.datetime.utcnow().isoformat() + "Z",
         "model": model_used,
     }
+
+    # AJOUTE (2026-09-28, demande Théo) : heatmap "respiration" auto-jouée
+    # 00h→23h59 sur le jour PRECIS du bilan (par opposition à flux.py qui
+    # moyenne sur tout l'historique par jour-de-semaine). Un seul download
+    # de l'archive brute du jour, réutilisé pour intraday_trips (10 min)
+    # ET pour le flux horaire par station — Paris uniquement (cf. docstring
+    # de _download_day_archive).
+    day_archive = _download_day_archive(date) if city_id == "paris" else None
+    if city_id == "paris":
+        entry["intraday_trips"] = _compute_intraday_traffic(date, day_df=day_archive)
+
+    daymap = None
+    if city_id == "paris" and day_archive is not None:
+        stations_meta = _fetch_stations_meta()
+        daymap = _compute_station_hourly_flux(date, day_archive, stations_meta)
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp_dir = Path(tmp)
@@ -561,6 +716,13 @@ def run_city(city_id: str, date: dt.date) -> None:
         out_path = tmp_dir / asset_name
         out_path.write_text(json.dumps(entry, ensure_ascii=False, indent=2))
         storage.upload_asset(RELEASE_DIGEST, out_path, asset_name)
+
+        if daymap is not None:
+            daymap_name = f"daymap_{city_id}_{date_str}.json"
+            daymap_path = tmp_dir / daymap_name
+            daymap_path.write_text(json.dumps(daymap, ensure_ascii=False, separators=(",", ":")))
+            storage.upload_asset(RELEASE_DIGEST, daymap_path, daymap_name)
+            print(f"[daily_digest] {city_id}: {daymap_name} publié ({daymap['n_stations']} stations)")
 
         # Index (liste des N derniers jours) — lu par la page d'archive
         # /blog/articles/dailymonitoring/<ville> côté webapp.
