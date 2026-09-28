@@ -46,6 +46,15 @@ GEMINI_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 )
 
+# TEST (2026-09-28) : Mistral comme fournisseur alternatif. Contrairement à
+# Gemini (une clé Google AI Studio par ville, quota très bas par clé sur le
+# tier gratuit), MISTRAL_API_KEY est un secret UNIQUE partagé entre les 9
+# villes — la Plateforme Mistral a un tier gratuit avec un débit par requête
+# plus permissif. Si ce secret est présent, il prend le pas sur les clés
+# Gemini par ville (voir run_city) : plus besoin de créer 9 clés séparées.
+MISTRAL_MODEL = "mistral-small-latest"
+MISTRAL_URL = "https://api.mistral.ai/v1/chat/completions"
+
 CITY_LABELS = {
     "paris": "Paris", "bordeaux": "Bordeaux", "lyon": "Lyon", "toulouse": "Toulouse",
     "lille": "Lille", "rennes": "Rennes", "strasbourg": "Strasbourg",
@@ -232,6 +241,56 @@ def _call_gemini(prompt: str, api_key: str) -> str:
     raise last_error or RuntimeError("Gemini: échec après 4 tentatives")
 
 
+def _call_mistral(prompt: str, api_key: str) -> str:
+    import random
+    import time
+
+    last_error: Exception | None = None
+    for attempt in range(MAX_GEMINI_ATTEMPTS):
+        r = requests.post(
+            MISTRAL_URL,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": MISTRAL_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.6,
+                "max_tokens": 2000,
+            },
+            timeout=60,
+        )
+        if r.status_code >= 400:
+            # Meme raisonnement que pour Gemini : le corps de reponse Mistral
+            # contient le vrai motif (cle invalide, rate limit...).
+            last_error = RuntimeError(f"Mistral HTTP {r.status_code}: {r.text[:500]}")
+            if r.status_code in RETRYABLE_STATUS and attempt < MAX_GEMINI_ATTEMPTS - 1:
+                m = _RETRY_AFTER_RE.search(r.text)
+                wait = (
+                    float(m.group(1)) + 2.0 if m
+                    else min(_MAX_BACKOFF_S, (2 ** attempt) + random.uniform(0, 1.5))
+                )
+                print(f"[daily_digest] Mistral HTTP {r.status_code} "
+                      f"(tentative {attempt + 1}/{MAX_GEMINI_ATTEMPTS}), "
+                      f"nouvel essai dans {wait:.1f}s"
+                      + (" (delai indique par l'API)" if m else ""))
+                time.sleep(wait)
+                continue
+            raise last_error
+
+        payload = r.json()
+        choices = payload.get("choices") or []
+        if not choices:
+            raise RuntimeError(f"Mistral n'a renvoyé aucune réponse exploitable: {payload}")
+        text = (choices[0].get("message") or {}).get("content", "")
+        if not text.strip():
+            raise RuntimeError("Mistral a renvoyé une réponse vide")
+        return text
+
+    raise last_error or RuntimeError(f"Mistral: échec après {MAX_GEMINI_ATTEMPTS} tentatives")
+
+
 def _parse_gemini_output(raw: str) -> tuple[str, str, str]:
     """Extrait (titre, résumé, corps markdown) du format attendu.
     Défensif : si Gemini ne respecte pas exactement le format, on
@@ -257,17 +316,18 @@ def _api_key_env_var(city_id: str) -> str:
 def run_city(city_id: str, date: dt.date) -> None:
     import os
 
-    # BUG CORRIGE ICI (2026-09-28) : une seule clé Gemini partagée entre
-    # les 9 villes se heurtait au quota très bas du tier gratuit (429
-    # "limit: 5"/min) dès que plusieurs villes tournaient rapprochées.
-    # Théo a créé une clé Google AI Studio PAR VILLE (quota indépendant
-    # pour chacune) — une clé manquante pour une ville = cette ville est
-    # simplement sautée (skip), jamais une erreur bloquante : permet
-    # d'activer les villes une par une au fur et à mesure des clés créées.
-    env_var = _api_key_env_var(city_id)
-    api_key = os.environ.get(env_var)
-    if not api_key:
-        print(f"[daily_digest] {city_id}: {env_var} absente, skip (pas encore de clé dédiée pour cette ville)")
+    # TEST (2026-09-28) : MISTRAL_API_KEY (secret unique, partagé entre les
+    # 9 villes) prend le pas sur les clés Gemini par ville si présente —
+    # plus simple à faire tourner sur toutes les villes d'un coup. Sinon on
+    # retombe sur l'ancien schéma : une clé Google AI Studio PAR VILLE
+    # (GEMINI_API_KEY_<VILLE>), une clé manquante pour une ville = cette
+    # ville est simplement sautée (skip), jamais une erreur bloquante.
+    mistral_key = os.environ.get("MISTRAL_API_KEY")
+    provider = "mistral" if mistral_key else "gemini"
+    gemini_env_var = _api_key_env_var(city_id)
+    gemini_key = None if mistral_key else os.environ.get(gemini_env_var)
+    if not mistral_key and not gemini_key:
+        print(f"[daily_digest] {city_id}: ni MISTRAL_API_KEY ni {gemini_env_var}, skip")
         return
 
     city_cfg = CITIES.get(city_id)
@@ -288,7 +348,12 @@ def run_city(city_id: str, date: dt.date) -> None:
         data_json=json.dumps(data, ensure_ascii=False, indent=2, default=str),
     )
 
-    raw = _call_gemini(prompt, api_key)
+    if provider == "mistral":
+        raw = _call_mistral(prompt, mistral_key)
+        model_used = MISTRAL_MODEL
+    else:
+        raw = _call_gemini(prompt, gemini_key)
+        model_used = GEMINI_MODEL
     title, summary, body = _parse_gemini_output(raw)
 
     date_str = date.isoformat()
@@ -299,7 +364,7 @@ def run_city(city_id: str, date: dt.date) -> None:
         "description": summary,
         "markdown": body,
         "generated_at": dt.datetime.utcnow().isoformat() + "Z",
-        "model": GEMINI_MODEL,
+        "model": model_used,
     }
 
     with tempfile.TemporaryDirectory() as tmp:
