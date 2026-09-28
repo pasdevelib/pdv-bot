@@ -25,6 +25,7 @@ import datetime as dt
 import json
 import re
 import tempfile
+import traceback
 from pathlib import Path
 
 import requests
@@ -165,7 +166,11 @@ def _call_gemini(prompt: str, api_key: str) -> str:
         },
         timeout=60,
     )
-    r.raise_for_status()
+    if r.status_code >= 400:
+        # Le corps de reponse Gemini contient le vrai motif (cle invalide,
+        # quota depasse, contenu bloque...) — raise_for_status() seul ne
+        # le montre pas, d'ou des erreurs illisibles dans les logs Actions.
+        raise RuntimeError(f"Gemini HTTP {r.status_code}: {r.text[:500]}")
     payload = r.json()
     candidates = payload.get("candidates") or []
     if not candidates:
@@ -273,7 +278,14 @@ def run(city_ids: list[str] | None = None) -> None:
         try:
             run_city(city_id, api_key, yesterday)
         except Exception as e:
-            print(f"[daily_digest] {city_id}: ECHEC ({e}) — villes suivantes non affectées")
+            # BUG CORRIGE ICI : {e} seul peut afficher un message vide ou
+            # trompeur (ex. KeyError affiche repr() de la clé, une
+            # requests.HTTPError peut avoir un message tronqué) — on log
+            # desormais le type ET la traceback complete, indispensable
+            # pour diagnostiquer depuis les logs GitHub Actions sans
+            # devoir reproduire localement.
+            print(f"[daily_digest] {city_id}: ECHEC ({type(e).__name__}: {e}) — villes suivantes non affectées")
+            traceback.print_exc()
 
 
 if __name__ == "__main__":
