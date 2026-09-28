@@ -42,8 +42,8 @@ watchdog.yml (*/15 min)
 | `live`       | `current_day.parquet`, `stations.json`, `snapshot_prev.parquet`      |
 | `history`    | `YYYY-MM-DD.parquet` (un par jour)                                    |
 | `aggregates` | `medians.parquet`, `weather.parquet`, `calendar.parquet`, `forecast_7d.parquet`, `hourly_history.parquet` |
-| `stats-cities` | Classements/analyses par ville, **8 villes** (Paris inclus)         |
-| `daily-digest` | Bilans quotidiens rédigés par IA, **8 villes**                      |
+| `stats-cities` | Classements/analyses par ville, **9 villes** (Paris + les 8 de pdvr-bot)         |
+| `daily-digest` | Bilans quotidiens rédigés par IA, **9 villes**                      |
 
 ## Pages consommant ces données
 
