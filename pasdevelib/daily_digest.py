@@ -625,16 +625,20 @@ def _api_key_env_var(city_id: str) -> str:
 def run_city(city_id: str, date: dt.date) -> None:
     import os
 
-    # TEST (2026-09-28) : MISTRAL_API_KEY (secret unique, partagé entre les
-    # 9 villes) prend le pas sur les clés Gemini par ville si présente —
-    # plus simple à faire tourner sur toutes les villes d'un coup. Sinon on
-    # retombe sur l'ancien schéma : une clé Google AI Studio PAR VILLE
-    # (GEMINI_API_KEY_<VILLE>), une clé manquante pour une ville = cette
-    # ville est simplement sautée (skip), jamais une erreur bloquante.
+    # MISTRAL_API_KEY (secret unique, partagé entre les 9 villes) essayé en
+    # PREMIER si présente, avec repli automatique sur Gemini (clé par ville,
+    # GEMINI_API_KEY_<VILLE>) en cas d'échec — pas seulement si la clé est
+    # absente. BUG CORRIGE ICI (2026-09-28) : jusqu'ici, dès que
+    # MISTRAL_API_KEY existait, gemini_key était forcé à None (`None if
+    # mistral_key else ...`), donc un Mistral en échec (429 permanent
+    # constaté sur ce compte, cf. diagnostic du 2026-09-28) faisait planter
+    # la ville entière sans repli possible — TOUTES les villes étaient
+    # bloquées depuis l'ajout de MISTRAL_API_KEY en secret, silencieusement
+    # absorbé par le try/except par-ville dans run(). On récupère désormais
+    # gemini_key dans tous les cas, et on ne l'ignore que si Mistral réussit.
     mistral_key = os.environ.get("MISTRAL_API_KEY")
-    provider = "mistral" if mistral_key else "gemini"
     gemini_env_var = _api_key_env_var(city_id)
-    gemini_key = None if mistral_key else os.environ.get(gemini_env_var)
+    gemini_key = os.environ.get(gemini_env_var)
     if not mistral_key and not gemini_key:
         print(f"[daily_digest] {city_id}: ni MISTRAL_API_KEY ni {gemini_env_var}, skip")
         return
@@ -658,10 +662,20 @@ def run_city(city_id: str, date: dt.date) -> None:
         data_json=json.dumps(data, ensure_ascii=False, indent=2, default=str),
     )
 
-    if provider == "mistral":
-        raw = _call_mistral(prompt, mistral_key)
-        model_used = MISTRAL_MODEL
-    else:
+    raw = None
+    model_used = None
+    if mistral_key:
+        try:
+            raw = _call_mistral(prompt, mistral_key)
+            model_used = MISTRAL_MODEL
+        except Exception as e:
+            if gemini_key:
+                print(f"[daily_digest] {city_id}: Mistral en échec ({type(e).__name__}: {e}), repli sur Gemini")
+            else:
+                raise
+    if raw is None:
+        if not gemini_key:
+            raise RuntimeError(f"{city_id}: Mistral en échec et pas de {gemini_env_var} pour un repli")
         raw = _call_gemini(prompt, gemini_key)
         model_used = GEMINI_MODEL
     parsed = _parse_json_output(raw)
