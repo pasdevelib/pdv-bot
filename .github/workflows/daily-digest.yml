@@ -1,21 +1,22 @@
 name: daily-digest
 
-# Bilan quotidien du réseau, rédigé par Gemini, pour les 9 villes
-# (Paris + les 8 gérées par pdvr-bot). Tourne ici (pas dans pdvr-bot) car
-# la source de données — stats_<ville>_*.json, release "stats-cities" —
-# est déjà centralisée ici pour les 9 villes (voir stats-cities.yml).
-# Sortie publiée sur blog.pasdevelib.app/blog/articles/dailymonitoring/<ville>.
+# Bilan quotidien du réseau, rédigé par Gemini. Tourne ici (pas dans
+# pdvr-bot) car la source de données — stats_<ville>_*.json, release
+# "stats-cities" — est déjà centralisée ici pour les 9 villes (voir
+# stats-cities.yml). Sortie publiée sur
+# blog.pasdevelib.app/blog/articles/dailymonitoring/<ville>.
 #
-# BUG CORRIGE ICI (2026-09-28) : contrairement à scrape-cities.yml /
-# consolidate-cities.yml (une API GBFS distincte par ville, donc matrice
-# + isolation pertinentes), ici les 9 villes tapent la MÊME clé Gemini,
-# soumise à un quota tier gratuit très bas (429 "limit: 5"/min constaté
-# en prod). Une matrice en parallèle garantissait de le dépasser à
-# chaque run. UN SEUL job, qui boucle sur les 9 villes en interne
-# (daily_digest.run(), déjà isolé ville par ville par un try/except —
-# un échec sur une ville n'empêche jamais les suivantes) : les appels
-# Gemini sont donc naturellement séquentiels, et _call_gemini() respecte
-# en plus le délai d'attente indiqué par l'API en cas de 429/503.
+# BUG CORRIGE ICI (2026-09-28) : une clé Gemini unique partagée entre
+# toutes les villes se heurtait au quota très bas du tier gratuit (429
+# "limit: 5"/min). Théo a créé une clé Google AI Studio PAR VILLE
+# (quota indépendant) — chacune en secret GEMINI_API_KEY_<VILLE>. Le
+# script (daily_digest.py) résout automatiquement la bonne clé par
+# ville et saute proprement celles qui n'en ont pas encore.
+#
+# EN TEST (2026-09-28) : seules paris/bordeaux/lyon ont une clé pour
+# l'instant — limité à ces 3 villes le temps de valider. Étendre au
+# fur et à mesure : ajouter un secret GEMINI_API_KEY_<VILLE>, la
+# passer ci-dessous en env, et l'ajouter à --cities.
 on:
   schedule:
     # 06:30 UTC, après stats-cities.yml (06:00)
@@ -27,7 +28,7 @@ permissions:
 
 jobs:
   digest:
-    name: Daily digest — toutes les villes
+    name: Daily digest
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -38,8 +39,10 @@ jobs:
           cache: pip
       - name: Install
         run: pip install -e . requests
-      - name: Generate digests
+      - name: Generate digests — paris, bordeaux, lyon
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: python -m pasdevelib.daily_digest
+          GEMINI_API_KEY_PARIS: ${{ secrets.GEMINI_API_KEY_PARIS }}
+          GEMINI_API_KEY_BORDEAUX: ${{ secrets.GEMINI_API_KEY_BORDEAUX }}
+          GEMINI_API_KEY_LYON: ${{ secrets.GEMINI_API_KEY_LYON }}
+        run: python -m pasdevelib.daily_digest --cities paris bordeaux lyon

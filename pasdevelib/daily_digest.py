@@ -240,7 +240,26 @@ def _parse_gemini_output(raw: str) -> tuple[str, str, str]:
     return title, summary, body
 
 
-def run_city(city_id: str, api_key: str, date: dt.date) -> None:
+def _api_key_env_var(city_id: str) -> str:
+    return f"GEMINI_API_KEY_{city_id.upper()}"
+
+
+def run_city(city_id: str, date: dt.date) -> None:
+    import os
+
+    # BUG CORRIGE ICI (2026-09-28) : une seule clé Gemini partagée entre
+    # les 9 villes se heurtait au quota très bas du tier gratuit (429
+    # "limit: 5"/min) dès que plusieurs villes tournaient rapprochées.
+    # Théo a créé une clé Google AI Studio PAR VILLE (quota indépendant
+    # pour chacune) — une clé manquante pour une ville = cette ville est
+    # simplement sautée (skip), jamais une erreur bloquante : permet
+    # d'activer les villes une par une au fur et à mesure des clés créées.
+    env_var = _api_key_env_var(city_id)
+    api_key = os.environ.get(env_var)
+    if not api_key:
+        print(f"[daily_digest] {city_id}: {env_var} absente, skip (pas encore de clé dédiée pour cette ville)")
+        return
+
     city_cfg = CITIES.get(city_id)
     city_label = CITY_LABELS.get(city_id, city_id.capitalize())
     network = city_cfg.system_name if city_cfg else city_label
@@ -297,12 +316,6 @@ def run_city(city_id: str, api_key: str, date: dt.date) -> None:
 
 
 def run(city_ids: list[str] | None = None) -> None:
-    import os
-
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        raise RuntimeError("GEMINI_API_KEY absente")
-
     if city_ids is None:
         city_ids = list(CITY_LABELS.keys())
 
@@ -314,9 +327,10 @@ def run(city_ids: list[str] | None = None) -> None:
 
     for city_id in city_ids:
         # Isolation par ville, même principe que consolidate_cities.py :
-        # un échec (Gemini, données manquantes) ne bloque jamais les autres.
+        # un échec (Gemini, données manquantes, clé absente) ne bloque
+        # jamais les autres.
         try:
-            run_city(city_id, api_key, yesterday)
+            run_city(city_id, yesterday)
         except Exception as e:
             # BUG CORRIGE ICI : {e} seul peut afficher un message vide ou
             # trompeur (ex. KeyError affiche repr() de la clé, une
