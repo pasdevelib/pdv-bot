@@ -160,13 +160,23 @@ def _gather_city_data(city_id: str) -> dict:
     return data
 
 
-# BUG CORRIGE ICI (2026-09-28) : premier run reel — 503 "high demand,
-# try again later" (surcharge transitoire cote Google, rien a voir avec
-# la cle ni le modele). Meme pattern de retry + backoff + gigue que
-# storage.upload_asset() pour le meme type de probleme (voir son
-# docstring) : la plupart des 429/500/502/503 se resolvent seuls en
-# quelques secondes.
+# BUG CORRIGE ICI (2026-09-28) : deux causes distinctes trouvees sur les
+# premiers runs reels :
+# 1. 503 "high demand" (transitoire, sans rapport avec la cle/le modele)
+#    — retry + backoff + gigue, meme pattern que storage.upload_asset().
+# 2. 429 RESOURCE_EXHAUSTED, "limit: 5" (quota tier gratuit tres bas
+#    pour ce modele, ~5 requetes/minute) — atteint des le run manuel
+#    suivant car le workflow lance les 9 villes EN PARALLELE (matrix),
+#    qui tapent toutes la meme cle en meme temps. Fix a deux niveaux :
+#    ici, on lit le "Please retry in Ns" que Gemini renvoie DANS le
+#    corps de la reponse 429 et on attend exactement ce delai (plutot
+#    qu'un backoff generique, inutile face a un quota qui ne se libere
+#    qu'a un instant precis) ; cote workflow (daily-digest.yml),
+#    max-parallel: 1 fait tourner les 9 villes en sequentiel, pas en
+#    parallele, pour ne plus jamais cumuler plusieurs requetes dans la
+#    meme fenetre glissante.
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+_RETRY_AFTER_RE = re.compile(r"retry in (\d+(?:\.\d+)?)s", re.IGNORECASE)
 
 
 def _call_gemini(prompt: str, api_key: str) -> str:
@@ -190,9 +200,11 @@ def _call_gemini(prompt: str, api_key: str) -> str:
             # le montre pas, d'ou des erreurs illisibles dans les logs Actions.
             last_error = RuntimeError(f"Gemini HTTP {r.status_code}: {r.text[:500]}")
             if r.status_code in RETRYABLE_STATUS and attempt < 3:
-                wait = (2 ** attempt) + random.uniform(0, 1.5)
+                m = _RETRY_AFTER_RE.search(r.text)
+                wait = float(m.group(1)) + 2.0 if m else (2 ** attempt) + random.uniform(0, 1.5)
                 print(f"[daily_digest] Gemini HTTP {r.status_code} (tentative {attempt + 1}/4), "
-                      f"nouvel essai dans {wait:.1f}s")
+                      f"nouvel essai dans {wait:.1f}s"
+                      + (" (delai indique par l'API)" if m else ""))
                 time.sleep(wait)
                 continue
             raise last_error

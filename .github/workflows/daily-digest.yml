@@ -1,11 +1,21 @@
 name: daily-digest
 
-# Bilan quotidien du réseau, rédigé par Gemini, pour les 8 villes
-# (Paris + les 7 gérées par pdvr-bot). Tourne ici (pas dans pdvr-bot) car
+# Bilan quotidien du réseau, rédigé par Gemini, pour les 9 villes
+# (Paris + les 8 gérées par pdvr-bot). Tourne ici (pas dans pdvr-bot) car
 # la source de données — stats_<ville>_*.json, release "stats-cities" —
-# est déjà centralisée ici pour les 8 villes (voir stats-cities.yml).
-# Matrice + fail-fast: false = isolation par ville. Sortie publiée sur
-# blog.pasdevelib.app/blog/articles/dailymonitoring/<ville>.
+# est déjà centralisée ici pour les 9 villes (voir stats-cities.yml).
+# Sortie publiée sur blog.pasdevelib.app/blog/articles/dailymonitoring/<ville>.
+#
+# BUG CORRIGE ICI (2026-09-28) : contrairement à scrape-cities.yml /
+# consolidate-cities.yml (une API GBFS distincte par ville, donc matrice
+# + isolation pertinentes), ici les 9 villes tapent la MÊME clé Gemini,
+# soumise à un quota tier gratuit très bas (429 "limit: 5"/min constaté
+# en prod). Une matrice en parallèle garantissait de le dépasser à
+# chaque run. UN SEUL job, qui boucle sur les 9 villes en interne
+# (daily_digest.run(), déjà isolé ville par ville par un try/except —
+# un échec sur une ville n'empêche jamais les suivantes) : les appels
+# Gemini sont donc naturellement séquentiels, et _call_gemini() respecte
+# en plus le délai d'attente indiqué par l'API en cas de 429/503.
 on:
   schedule:
     # 06:30 UTC, après stats-cities.yml (06:00)
@@ -17,13 +27,9 @@ permissions:
 
 jobs:
   digest:
-    name: Digest ${{ matrix.city }}
+    name: Daily digest — toutes les villes
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    strategy:
-      fail-fast: false
-      matrix:
-        city: [paris, bordeaux, lille, lyon, montpellier, nantes, rennes, strasbourg, toulouse]
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -32,8 +38,8 @@ jobs:
           cache: pip
       - name: Install
         run: pip install -e . requests
-      - name: Generate digest — ${{ matrix.city }}
+      - name: Generate digests
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: python -m pasdevelib.daily_digest --cities ${{ matrix.city }}
+        run: python -m pasdevelib.daily_digest
