@@ -66,8 +66,18 @@ PERIODS = {
 }
 
 
-def _download_parquet(release: str, asset: str) -> pd.DataFrame | None:
-    url = f"https://github.com/{storage.REPO}/releases/download/{release}/{asset}"
+# BUG CORRIGE ICI (2026-09-28) : les villes hors Paris tournent désormais
+# dans un dépôt séparé (pasdevelib/pdvr-bot). Ce workflow (stats-cities.yml)
+# lui, reste dans pdv-bot car il a besoin de lire les DEUX cotés (donnees
+# Paris ici + donnees villes dans pdvr-bot) — voir README de pdvr-bot.
+# CITIES_REPO cible donc explicitement pdvr-bot pour cities-live/
+# cities-history, jamais storage.REPO (qui vaut pdv-bot ici). Lecture
+# anonyme sur un repo public, donc aucun token necessaire.
+CITIES_REPO = "pasdevelib/pdvr-bot"
+
+
+def _download_parquet(release: str, asset: str, repo: str | None = None) -> pd.DataFrame | None:
+    url = f"https://github.com/{repo or storage.REPO}/releases/download/{release}/{asset}"
     r = requests.get(url, timeout=60)
     if r.status_code == 404:
         return None
@@ -75,8 +85,8 @@ def _download_parquet(release: str, asset: str) -> pd.DataFrame | None:
     return pd.read_parquet(io.BytesIO(r.content))
 
 
-def _download_json(release: str, asset: str) -> list | None:
-    url = f"https://github.com/{storage.REPO}/releases/download/{release}/{asset}"
+def _download_json(release: str, asset: str, repo: str | None = None) -> list | None:
+    url = f"https://github.com/{repo or storage.REPO}/releases/download/{release}/{asset}"
     r = requests.get(url, timeout=60)
     if r.status_code == 404:
         return None
@@ -101,8 +111,8 @@ def _load_history_and_names(city_id: str) -> tuple[pd.DataFrame, dict[str, str],
         zones = {sid(s): s["zone"] for s in (stations_raw or []) if s.get("zone")}
         capacities = {sid(s): float(s.get("capacity") or 0) for s in (stations_raw or [])}
     else:
-        hourly = _download_parquet("cities-history", f"hourly_history_{city_id}.parquet")
-        stations_raw = _download_json("cities-live", "stations_cities.json")
+        hourly = _download_parquet("cities-history", f"hourly_history_{city_id}.parquet", repo=CITIES_REPO)
+        stations_raw = _download_json("cities-live", "stations_cities.json", repo=CITIES_REPO)
         city_stations = [s for s in (stations_raw or []) if s.get("city_id") == city_id]
         sid = lambda s: str(s.get("station_id") or s.get("id") or "")
         names = {sid(s): s.get("name", sid(s)) for s in city_stations}

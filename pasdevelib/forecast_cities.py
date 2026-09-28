@@ -52,16 +52,28 @@ RELEASE_CITIES_AGGREGATES = "cities-aggregates"  # sortie de ce module
 
 CALENDAR_ASSET = "calendar.parquet"           # national, partagé avec Paris
 
+# BUG CORRIGE ICI (2026-09-28) : les villes hors Paris tournent désormais
+# dans un dépôt séparé (pasdevelib/pdvr-bot, cf. README de ce dépôt),
+# avec ses propres releases cities-live/cities-history/cities-aggregates
+# (storage.REPO y vaut pdvr-bot). Mais calendar.parquet et weather.parquet
+# restent une release Paris (limite connue et acceptée, voir docstring en
+# tête de module) — ces deux lectures doivent donc TOUJOURS cibler
+# pasdevelib/pdv-bot explicitement, jamais storage.REPO. Ce sont des
+# lectures anonymes sur un repo public, donc aucun token n'est nécessaire
+# (contrairement au GITHUB_TOKEN par défaut d'Actions, qui refuse tout
+# appel API vers un autre dépôt même public).
+PARIS_REPO = "pasdevelib/pdv-bot"
 
-def _download_parquet(release: str, asset: str) -> pd.DataFrame:
-    url = f"https://github.com/{storage.REPO}/releases/download/{release}/{asset}"
+
+def _download_parquet(release: str, asset: str, repo: str | None = None) -> pd.DataFrame:
+    url = f"https://github.com/{repo or storage.REPO}/releases/download/{release}/{asset}"
     r = requests.get(url, timeout=60)
     r.raise_for_status()
     return pd.read_parquet(io.BytesIO(r.content))
 
 
-def _download_json(release: str, asset: str) -> list:
-    url = f"https://github.com/{storage.REPO}/releases/download/{release}/{asset}"
+def _download_json(release: str, asset: str, repo: str | None = None) -> list:
+    url = f"https://github.com/{repo or storage.REPO}/releases/download/{release}/{asset}"
     r = requests.get(url, timeout=60)
     r.raise_for_status()
     return r.json()
@@ -223,14 +235,14 @@ def run(city_ids: list[str] | None = None) -> None:
     # Calendrier historique national, partagé avec Paris (mêmes jours
     # analogues candidats — voir limite connue dans la docstring du module).
     print("[forecast_cities] loading national calendar...")
-    calendar_existing = _download_parquet(storage.RELEASE_AGGREGATES, CALENDAR_ASSET)
+    calendar_existing = _download_parquet(storage.RELEASE_AGGREGATES, CALENDAR_ASSET, repo=PARIS_REPO)
 
     # Meme correctif que forecast.py (voir predict.py pour le detail complet
     # du bug corrige) : sans meteo/saison sur les candidats, le matching
     # d'analogues degenerait vers une selection quasi arbitraire. Reutilise
     # la meteo nationale (meme limite connue et acceptee que le calendrier).
     try:
-        weather_hourly_hist = _download_parquet(storage.RELEASE_AGGREGATES, "weather.parquet")
+        weather_hourly_hist = _download_parquet(storage.RELEASE_AGGREGATES, "weather.parquet", repo=PARIS_REPO)
         weather_daily_hist = calendar_feats.aggregate_daily_weather(weather_hourly_hist)
         print(f"[forecast_cities] {len(weather_daily_hist):,} jours de meteo historique charges")
     except Exception as e:

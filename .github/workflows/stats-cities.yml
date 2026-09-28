@@ -1,0 +1,40 @@
+name: stats-cities
+
+# Classements quotidiens des stations (vides/pleines/fiables), par ville,
+# sur 3 fenetres (jour/semaine/mois). Alimente blog.pasdevelib.app/donnees.
+#
+# BUG CORRIGE ICI (2026-09-28) : les villes hors Paris ont ete migrees
+# vers pasdevelib/pdvr-bot (voir scrape-cities/consolidate-cities/
+# forecast-cities dans ce dépôt et README de pdvr-bot). CE workflow-ci
+# reste dans pdv-bot car stats_cities.py a besoin de lire les DEUX cotes
+# dans la meme execution (donnees Paris locales ici + donnees des villes
+# dans pdvr-bot, lues en anonyme puisque pdvr-bot est public — voir
+# CITIES_REPO dans pasdevelib/stats_cities.py). Le dupliquer coute plus
+# cher que de le garder ici : ~1 declaration schedule/jour, sans commune
+# mesure avec le */5 min qui causait la regression initiale.
+on:
+  schedule:
+    # 06:00 UTC, apres consolidate-cities.yml (03:30, pdvr-bot) et forecast-cities (05:45, pdvr-bot)
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  stats:
+    name: Stats toutes villes
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install
+        run: pip install -e . requests pandas pyarrow
+      - name: Compute stats
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python -m pasdevelib.stats_cities
