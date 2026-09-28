@@ -160,30 +160,54 @@ def _gather_city_data(city_id: str) -> dict:
     return data
 
 
+# BUG CORRIGE ICI (2026-09-28) : premier run reel — 503 "high demand,
+# try again later" (surcharge transitoire cote Google, rien a voir avec
+# la cle ni le modele). Meme pattern de retry + backoff + gigue que
+# storage.upload_asset() pour le meme type de probleme (voir son
+# docstring) : la plupart des 429/500/502/503 se resolvent seuls en
+# quelques secondes.
+RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
+
 def _call_gemini(prompt: str, api_key: str) -> str:
-    r = requests.post(
-        f"{GEMINI_URL}?key={api_key}",
-        headers={"Content-Type": "application/json"},
-        json={
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": 0.6, "maxOutputTokens": 2000},
-        },
-        timeout=60,
-    )
-    if r.status_code >= 400:
-        # Le corps de reponse Gemini contient le vrai motif (cle invalide,
-        # quota depasse, contenu bloque...) — raise_for_status() seul ne
-        # le montre pas, d'ou des erreurs illisibles dans les logs Actions.
-        raise RuntimeError(f"Gemini HTTP {r.status_code}: {r.text[:500]}")
-    payload = r.json()
-    candidates = payload.get("candidates") or []
-    if not candidates:
-        raise RuntimeError(f"Gemini n'a renvoyé aucune réponse exploitable: {payload}")
-    parts = candidates[0].get("content", {}).get("parts", [])
-    text = "".join(p.get("text", "") for p in parts)
-    if not text.strip():
-        raise RuntimeError("Gemini a renvoyé une réponse vide")
-    return text
+    import random
+    import time
+
+    last_error: Exception | None = None
+    for attempt in range(4):
+        r = requests.post(
+            f"{GEMINI_URL}?key={api_key}",
+            headers={"Content-Type": "application/json"},
+            json={
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {"temperature": 0.6, "maxOutputTokens": 2000},
+            },
+            timeout=60,
+        )
+        if r.status_code >= 400:
+            # Le corps de reponse Gemini contient le vrai motif (cle invalide,
+            # quota depasse, contenu bloque...) — raise_for_status() seul ne
+            # le montre pas, d'ou des erreurs illisibles dans les logs Actions.
+            last_error = RuntimeError(f"Gemini HTTP {r.status_code}: {r.text[:500]}")
+            if r.status_code in RETRYABLE_STATUS and attempt < 3:
+                wait = (2 ** attempt) + random.uniform(0, 1.5)
+                print(f"[daily_digest] Gemini HTTP {r.status_code} (tentative {attempt + 1}/4), "
+                      f"nouvel essai dans {wait:.1f}s")
+                time.sleep(wait)
+                continue
+            raise last_error
+
+        payload = r.json()
+        candidates = payload.get("candidates") or []
+        if not candidates:
+            raise RuntimeError(f"Gemini n'a renvoyé aucune réponse exploitable: {payload}")
+        parts = candidates[0].get("content", {}).get("parts", [])
+        text = "".join(p.get("text", "") for p in parts)
+        if not text.strip():
+            raise RuntimeError("Gemini a renvoyé une réponse vide")
+        return text
+
+    raise last_error or RuntimeError("Gemini: échec après 4 tentatives")
 
 
 def _parse_gemini_output(raw: str) -> tuple[str, str, str]:
