@@ -267,6 +267,20 @@ def _call_gemini(prompt: str, api_key: str) -> str:
             # quota depasse, contenu bloque...) — raise_for_status() seul ne
             # le montre pas, d'ou des erreurs illisibles dans les logs Actions.
             last_error = RuntimeError(f"Gemini HTTP {r.status_code}: {r.text[:500]}")
+            # AJOUTE (2026-09-29) : un 429 "free_tier_requests" est un quota
+            # JOURNALIER (constaté : limit 20/jour sur gemini-3.8-flash), pas
+            # un throttle par minute — le "Please retry in Ns" du message
+            # concerne une fenêtre courte qui ne débloque rien une fois le
+            # quota du jour consommé. Retenter 6 fois avec backoff dans ce
+            # cas ne fait que gaspiller le peu de quota restant (chaque
+            # tentative compte) sans jamais réussir. On abandonne
+            # immédiatement pour ce run ; le prochain run (lendemain, ou
+            # après relèvement du quota/billing côté Google AI Studio)
+            # repartira avec un quota neuf.
+            if r.status_code == 429 and "free_tier_requests" in r.text:
+                print("[daily_digest] Gemini 429 = quota journalier free-tier épuisé, "
+                      "abandon immédiat (retenter ne débloquera rien avant demain)")
+                raise last_error
             if r.status_code in RETRYABLE_STATUS and attempt < MAX_GEMINI_ATTEMPTS - 1:
                 m = _RETRY_AFTER_RE.search(r.text)
                 wait = (
