@@ -58,4 +58,3 @@ pip install -e .
 ```
 
 Secrets requis (GitHub Actions → Settings → Secrets) : `RESEND_API_KEY` (alertes watchdog), `GEMINI_API_KEY` (daily-digest). `GH_TOKEN` est le token par défaut d'Actions (`contents: write` sur ce dépôt) — aucun PAT dédié nécessaire.
-# test Tue Sep 29 20:37:53 CEST 2026
