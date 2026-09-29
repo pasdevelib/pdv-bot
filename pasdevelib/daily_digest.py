@@ -788,6 +788,25 @@ def run(city_ids: list[str] | None = None) -> None:
             # devoir reproduire localement.
             print(f"[daily_digest] {city_id}: ECHEC ({type(e).__name__}: {e}) — villes suivantes non affectées")
             traceback.print_exc()
+            # AJOUTE (2026-09-29) : les logs des runs Actions ne sont pas
+            # consultables depuis l'environnement d'agent utilisé pour
+            # développer ce bot (les téléchargements de logs, hébergés sur
+            # Azure Blob, sont bloqués par la politique réseau de cet
+            # environnement — l'API GitHub elle-même n'est pas en cause).
+            # On publie donc la traceback comme asset de la release
+            # "daily-digest", lisible via l'API releases (non bloquée),
+            # pour pouvoir diagnostiquer un échec sans accès aux logs.
+            try:
+                with tempfile.TemporaryDirectory() as tmp:
+                    err_path = Path(tmp) / f"digest_{city_id}_last_error.txt"
+                    err_path.write_text(
+                        f"{dt.datetime.utcnow().isoformat()}Z — date bilan: {yesterday.isoformat()}\n\n"
+                        + traceback.format_exc()
+                    )
+                    storage.upload_asset(RELEASE_DIGEST, err_path, err_path.name)
+            except Exception:
+                print(f"[daily_digest] {city_id}: échec de la publication de la traceback de diagnostic")
+                traceback.print_exc()
 
 
 if __name__ == "__main__":
