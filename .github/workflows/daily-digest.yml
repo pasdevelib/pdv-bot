@@ -13,12 +13,21 @@ name: daily-digest
 # script (daily_digest.py) résout automatiquement la bonne clé par
 # ville et saute proprement celles qui n'en ont pas encore.
 #
-# EN TEST (2026-09-28) : ajout de MISTRAL_API_KEY, secret UNIQUE et
-# partagé entre les 9 villes (voir daily_digest.py) — évite d'avoir à
-# créer une clé Google AI Studio par ville. Si ce secret est présent,
-# daily_digest.py bascule automatiquement toutes les villes dessus
-# (Gemini reste le fallback si le secret est absent). Pas de --cities
-# ici : on laisse tourner les 9 villes par défaut pour ce test.
+# SIMPLIFIE (2026-09-29, demande Théo : "je veux juste le daily de
+# paris") : l'essai MISTRAL_API_KEY du 2026-09-28 s'est révélé
+# définitivement cassé côté compte Mistral (HTTP 429 "Rate limit
+# exceeded" sur 100% des appels, deux jours de suite, dès la toute
+# première tentative — pas un problème de cadence ni de code). Le
+# secret gaspillait ~5 min par run en retries avant même d'atteindre le
+# repli Gemini (daily_digest.py essaie encore Mistral en premier s'il
+# reçoit la variable, cf. son code). Retiré ici : on va direct sur
+# GEMINI_API_KEY_PARIS, qui a déjà fonctionné (run du 2026-09-28 19h11).
+# --cities paris : on ne tente plus les 8 autres villes, qui n'ont de
+# toute façon pas de clé Gemini dédiée ET dont pdvr-bot ne produit
+# aucune donnée actuellement (cf. discussion) — inutile de les faire
+# échouer à chaque run. Pour les relancer un jour : retirer --cities et
+# recréer GEMINI_API_KEY_<VILLE> (ou réessayer Mistral une fois leur
+# compte débloqué).
 on:
   schedule:
     # 06:30 UTC, après stats-cities.yml (06:00)
@@ -41,11 +50,8 @@ jobs:
           cache: pip
       - name: Install
         run: pip install -e . requests
-      - name: Generate digests — 9 villes (Mistral si dispo, sinon Gemini par ville)
+      - name: Generate digest — Paris (Gemini)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
           GEMINI_API_KEY_PARIS: ${{ secrets.GEMINI_API_KEY_PARIS }}
-          GEMINI_API_KEY_BORDEAUX: ${{ secrets.GEMINI_API_KEY_BORDEAUX }}
-          GEMINI_API_KEY_LYON: ${{ secrets.GEMINI_API_KEY_LYON }}
-        run: python -m pasdevelib.daily_digest
+        run: python -m pasdevelib.daily_digest --cities paris
